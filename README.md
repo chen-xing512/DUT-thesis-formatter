@@ -148,6 +148,7 @@ dut-thesis-formatter/
 ## 规范来源与优先级
 
 本Skill借助DeepSeek Flash生成，并参考了 @Gorilla-Kevv/scnu-thesis-formatter
+
 规则提炼自大连理工大学研究生院《大连理工大学硕士学位论文格式规范》（2026-04-15 版），
 并交叉核对了官方 Word 模板的样式定义（`摘要题目` / `图名中文` / `参考文献正文` / `公式` 等
 自定义样式的 `w:rFonts`、`w:sz`、`w:spacing`、`w:outlineLvl` 属性）与 LaTeX 模板
