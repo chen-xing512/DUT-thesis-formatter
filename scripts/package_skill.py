@@ -16,6 +16,7 @@ from pathlib import Path
 # 会白白撑大技能包，用户不需要。
 INCLUDE = [
     'SKILL.md',
+    'install-prompt.txt',
     'README.md',
     'LICENSE',
     'references/dut-format-rules.md',
@@ -27,6 +28,7 @@ INCLUDE = [
     'scripts/convert_with_word.sh',
     'scripts/tests/test_smoke.py',
     'docs/demo.png',
+    'docs/INSTALL.md',
     'docs/RENDERING.md',
 ]
 

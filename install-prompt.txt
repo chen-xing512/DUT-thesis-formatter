@@ -1,0 +1,20 @@
+请帮我安装一个 Agent Skill：
+
+仓库：https://github.com/chen-xing512/DUT-thesis-formatter.git
+技能名：dut-thesis-formatter
+
+要求：
+1. 找到本 Agent 工具的技能目录（skills 目录）。若无法确定，
+   先把探测到的候选路径列给我确认，不要自己猜着写。
+   常见约定：Claude Code → ~/.claude/skills/
+             DeepSeek Harness → $DSH_HOME/skills/（默认 ~/.dsh/skills/）
+             项目级 → <项目根>/.claude/skills/ 或 <项目根>/.dsh/skills/
+2. 把仓库克隆到技能目录，目录名必须是 dut-thesis-formatter
+   （要与 SKILL.md 里 frontmatter 的 name 一致，否则可能加载不到）。
+   已存在同名目录时先告诉我，不要直接覆盖。
+3. 确认技能目录里有 SKILL.md，frontmatter 的 name / description 完整。
+4. 检查 python-docx 是否已安装；缺的话装到本 Agent 实际使用的解释器里。
+5. 用这份最小代码自检并报告输出：
+       from docx import Document
+       from dut_thesis import reformat, audit, print_report
+6. 最后告诉我：装到了哪个绝对路径、依赖是否就绪、是否需要重启会话生效。

@@ -1,8 +1,7 @@
 # dut-thesis-formatter
 
-这是一个Skill，把中文论文草稿的 `.docx` **就地改写**为符合《大连理工大学硕士学位论文格式规范》的成品。
+把中文论文草稿的 `.docx` **就地改写**为符合《大连理工大学硕士学位论文格式规范》的成品。
 也可从零生成符合规范的论文骨架，或对任意 `.docx` 做格式体检。
-本Skill参考了 @Gorilla-Kevv/scnu-thesis-formatter
 
 ![DUT 格式排版效果与关键规范值](docs/demo.png)
 
@@ -32,20 +31,88 @@
 
 ## 安装
 
-### 方式一：直接复制到技能目录
+这是一个遵循 `SKILL.md` + YAML frontmatter 约定的 Agent Skill，适用于
+**Claude Code、DeepSeek Harness（DSH）**以及其它支持该约定的 Agent 工具。
+详见 [`docs/INSTALL.md`](docs/INSTALL.md)。
+
+### 方式一：让 Agent 自己装（推荐）
+
+最简单——把下面整段贴给你的 Agent，它会自己找技能目录、克隆、装依赖并自检：
+
+````text
+请帮我安装一个 Agent Skill：
+
+仓库：https://github.com/chen-xing512/DUT-thesis-formatter.git
+技能名：dut-thesis-formatter
+
+要求：
+1. 找到本 Agent 工具的技能目录（skills 目录）。若无法确定，
+   先把探测到的候选路径列给我确认，不要自己猜着写。
+   常见约定：Claude Code → ~/.claude/skills/
+             DeepSeek Harness → $DSH_HOME/skills/（默认 ~/.dsh/skills/）
+             项目级 → <项目根>/.claude/skills/ 或 <项目根>/.dsh/skills/
+2. 把仓库克隆到技能目录，目录名必须是 dut-thesis-formatter
+   （要与 SKILL.md 里 frontmatter 的 name 一致，否则可能加载不到）。
+   已存在同名目录时先告诉我，不要直接覆盖。
+3. 确认技能目录里有 SKILL.md，frontmatter 的 name / description 完整。
+4. 检查 python-docx 是否已安装；缺的话装到本 Agent 实际使用的解释器里。
+5. 用这份最小代码自检并报告输出：
+       from docx import Document
+       from dut_thesis import reformat, audit, print_report
+6. 最后告诉我：装到了哪个绝对路径、依赖是否就绪、是否需要重启会话生效。
+````
+
+这样写是有原因的，几个容易踩的点都在提示词里约束住了：
+
+- **技能名要对齐 frontmatter** —— 克隆出的目录名若与 `SKILL.md` 里的 `name:` 不一致，
+  有的工具会加载不到；
+- **别让 Agent 猜目录** —— 各工具约定不同、还可能读环境变量（如 DSH 的 `$DSH_HOME`），
+  所以要求"不确定就先问"；
+- **别直接覆盖** —— 避免误删已有同名技能；
+- **装完要自检** —— 确认 `SKILL.md` 与 `dut_thesis.py` 真能导入。
+
+### 方式二：自己克隆（通用）
+
+先确认你的工具用哪个技能目录：
+
+| 工具 | 用户级 | 项目级 |
+|---|---|---|
+| Claude Code | `~/.claude/skills/` | `<项目>/.claude/skills/` |
+| DeepSeek Harness | `$DSH_HOME/skills/`（默认 `~/.dsh/skills/`） | `<项目>/.dsh/skills/` |
+| 其它工具 | 查该工具的 skills / extensions 配置 | 同上 |
 
 ```bash
-# 用户级（所有项目可用）
-git clone https://github.com/<you>/dut-thesis-formatter.git \
-  ~/.dsh/skills/dut-thesis-formatter
+# 把 <技能目录> 换成上表对应的一列
+git clone https://github.com/chen-xing512/DUT-thesis-formatter.git \
+  <技能目录>/dut-thesis-formatter
 
-# 或项目级
-git clone https://github.com/<you>/dut-thesis-formatter.git \
-  .dsh/skills/dut-thesis-formatter
+# 例：Claude Code 用户级
+git clone https://github.com/chen-xing512/DUT-thesis-formatter.git \
+  ~/.claude/skills/dut-thesis-formatter
 ```
 
-Claude Code、DSH 等支持 `SKILL.md` + YAML frontmatter 的 Agent 工具会**自动发现**该技能，
-无需手动点名——触发条件写在 `SKILL.md` 的 `description` 里。
+装完确认：
+
+```bash
+ls <技能目录>/dut-thesis-formatter/SKILL.md
+```
+
+支持 `SKILL.md` + frontmatter 的工具会**自动发现**该技能，无需手动点名——
+触发条件写在 `SKILL.md` 的 `description` 里。
+
+### 方式三：打包成 `.skill` 再导入
+
+适合只接受压缩包导入的工具，或需要离线分发时：
+
+```bash
+git clone https://github.com/chen-xing512/DUT-thesis-formatter.git
+cd dut-thesis-formatter
+python scripts/package_skill.py     # 生成 dist/dut-thesis-formatter.skill
+```
+
+仓库打 `v*` 标签时，GitHub Actions 会自动跑测试、打包并发布到
+[Releases](https://github.com/chen-xing512/DUT-thesis-formatter/releases)，
+也可以直接下载。
 
 ### 渲染成 PDF / 效果图（可选）
 
@@ -61,13 +128,6 @@ Claude Code、DSH 等支持 `SKILL.md` + YAML frontmatter 的 Agent 工具会**�
 
 ```bash
 soffice --headless --convert-to pdf --outdir . 论文_DUT.docx
-```
-
-### 方式二：打包成 `.skill` 再导入
-
-```bash
-python scripts/package_skill.py
-# 生成 dist/dut-thesis-formatter.skill
 ```
 
 ## 依赖
@@ -128,26 +188,27 @@ print_report(audit(Document('论文_DUT.docx')))    # 交付前必做
 dut-thesis-formatter/
 ├── SKILL.md                          # 技能定义 + 工作流 + 质量自检清单
 ├── README.md
+├── install-prompt.txt                # 「让 Agent 自己装」那段提示词，可直接复制
 ├── LICENSE
 ├── references/
 │   └── dut-format-rules.md           # 硬编码的 DUT 格式规范（唯一事实来源）
 ├── scripts/
 │   ├── dut_thesis.py                 # 核心库：python-docx 全部排版函数 + reformat/audit
 │   ├── cli.py                        # 命令行：reformat / audit / template
-│   ├── convert_with_word.sh          # 用 Word 把 docx 转 PDF（需在沙箱外运行）
-│   ├── make_demo.py                  # 造内容完整的示例论文
+│   ├── convert_with_word.sh          # 用 Word 把 docx 转 PDF（须在沙箱外运行）
+│   ├── make_demo.py                  # 生成规格示意面板
+│   ├── make_showcase.py              # 造内容完整的示例论文（11 页）
 │   ├── make_demo_real.py             # 把渲染出的 PDF 合成 docs/demo.png
 │   ├── package_skill.py              # 打包 .skill（CI 也用它）
 │   └── tests/test_smoke.py           # 端到端冒烟测试：生成 → 改写 → 校验
 ├── docs/
 │   ├── demo.png                      # 真实渲染的效果图
+│   ├── INSTALL.md                    # 安装指南（三种方式 + 各工具技能目录）
 │   └── RENDERING.md                  # 渲染成 PDF/图片的三种路径与排错
 └── .github/workflows/release.yml     # 打 v* 标签 → 跑测试 → 打包并发布 Release
 ```
 
 ## 规范来源与优先级
-
-本Skill借助DeepSeek Flash生成，并参考了 @Gorilla-Kevv/scnu-thesis-formatter
 
 规则提炼自大连理工大学研究生院《大连理工大学硕士学位论文格式规范》（2026-04-15 版），
 并交叉核对了官方 Word 模板的样式定义（`摘要题目` / `图名中文` / `参考文献正文` / `公式` 等

@@ -21,6 +21,29 @@ license: MIT
 核心是**复用现成脚本**（`scripts/dut_thesis.py`），而不是每次重写 python-docx 的
 分节/页码/三线表/`w:eastAsia` 字体那套样板代码——那是最容易出错、最费 token 的部分。
 
+## 安装（若提示词要求你安装本技能）
+
+本技能遵循 `SKILL.md` + YAML frontmatter 约定，适用于 Claude Code、DSH 及其它
+支持该约定的 Agent 工具。用户让你安装时按下面做，**不要凭猜测写路径**：
+
+1. **先确定技能目录**，拿不准就把候选路径列给用户确认。
+   常见约定：
+   - Claude Code：`~/.claude/skills/`（用户级）、`<项目>/.claude/skills/`（项目级）
+   - DeepSeek Harness：`$DSH_HOME/skills/`（默认 `~/.dsh/skills/`）、`<项目>/.dsh/skills/`
+   - 其它工具：查它的 skills / extensions 配置
+2. **克隆时目录名必须是 `dut-thesis-formatter`**，与 `SKILL.md` 里
+   frontmatter 的 `name:` 严格一致，否则有的工具加载不到。已存在同名目录时先问用户。
+3. **装依赖**到本 Agent 实际使用的解释器：`pip install python-docx`
+4. **自检**并报告输出：
+
+   ```python
+   from docx import Document
+   from dut_thesis import reformat, audit, print_report
+   ```
+
+仓库：<https://github.com/chen-xing512/DUT-thesis-formatter.git>
+完整安装指南：[`docs/INSTALL.md`](docs/INSTALL.md)
+
 ## 前置依赖
 
 ```bash
