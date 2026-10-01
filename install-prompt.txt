@@ -7,6 +7,7 @@
 1. 找到本 Agent 工具的技能目录（skills 目录）。若无法确定，
    先把探测到的候选路径列给我确认，不要自己猜着写。
    常见约定：Claude Code → ~/.claude/skills/
+             Codex → $CODEX_HOME/skills/（默认 ~/.codex/skills/）
              DeepSeek Harness → $DSH_HOME/skills/（默认 ~/.dsh/skills/）
              项目级 → <项目根>/.claude/skills/ 或 <项目根>/.dsh/skills/
 2. 把仓库克隆到技能目录，目录名必须是 dut-thesis-formatter

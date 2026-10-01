@@ -29,6 +29,7 @@ pip install python-docx      # 或：python -m pip install python-docx
    先把探测到的候选路径列给我确认，不要自己猜着写。
    常见约定见下：
      - Claude Code      ~/.claude/skills/
+     - Codex            $CODEX_HOME/skills/（默认 ~/.codex/skills/）
      - DeepSeek Harness $DSH_HOME/skills/（默认 ~/.dsh/skills/）
      - 项目级           <项目根>/.claude/skills/  或  <项目根>/.dsh/skills/
 2. 把仓库克隆到技能目录，目录名必须是 dut-thesis-formatter
@@ -60,11 +61,14 @@ pip install python-docx      # 或：python -m pip install python-docx
 
 先确认你的工具用的是哪个技能目录：
 
-| 工具 | 用户级 | 项目级 |
+| 工具 | 用户级技能目录 | 项目级 |
 |---|---|---|
 | Claude Code | `~/.claude/skills/` | `<项目>/.claude/skills/` |
-| DeepSeek Harness | `$DSH_HOME/skills/`（默认 `~/.dsh/skills/`） | `<项目>/.dsh/skills/` |
+| Codex | `$CODEX_HOME/skills/` | 用用户级 |
+| DeepSeek Harness | `$DSH_HOME/skills/` | `<项目>/.dsh/skills/` |
 | 其它工具 | 查该工具的 skills / extensions 配置 | 同上 |
+
+> `$CODEX_HOME` 默认 `~/.codex`，`$DSH_HOME` 默认 `~/.dsh`。
 
 ```bash
 # 用户级（所有项目可用）——把 <技能目录> 换成上表里对应的一列
@@ -75,10 +79,32 @@ git clone https://github.com/chen-xing512/DUT-thesis-formatter.git \
 git clone https://github.com/chen-xing512/DUT-thesis-formatter.git \
   ~/.claude/skills/dut-thesis-formatter
 
+# 例：Codex 用户级
+git clone https://github.com/chen-xing512/DUT-thesis-formatter.git \
+  ~/.codex/skills/dut-thesis-formatter
+
 # 例：DSH 项目级
 git clone https://github.com/chen-xing512/DUT-thesis-formatter.git \
   .dsh/skills/dut-thesis-formatter
 ```
+
+### Codex
+
+Codex 扫描 `$CODEX_HOME/skills/<技能名>/SKILL.md`（默认 `~/.codex/skills/`）。
+**`git clone` 到该目录就是完整安装步骤**，克隆完下一轮对话即可用。
+
+Codex 自带 `skill-installer` 技能，但它的 `--path` 只接受**仓库内的子目录**：
+
+```bash
+# 下面这条对本仓库无效（SKILL.md 在仓库根目录）
+python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
+  --repo chen-xing512/DUT-thesis-formatter --path .
+# → Error: Invalid skill name.
+```
+
+因为 `--path` 会同时用作目标目录名，而 `.` 不是合法技能名。本仓库 `SKILL.md`
+在根目录，所以直接用 `git clone` 即可；若将来仓库改成
+`dut-thesis-formatter/SKILL.md` 的子目录形态，才能用该脚本。
 
 装完确认一下：
 

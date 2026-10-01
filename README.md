@@ -49,6 +49,7 @@
 1. 找到本 Agent 工具的技能目录（skills 目录）。若无法确定，
    先把探测到的候选路径列给我确认，不要自己猜着写。
    常见约定：Claude Code → ~/.claude/skills/
+             Codex → $CODEX_HOME/skills/（默认 ~/.codex/skills/）
              DeepSeek Harness → $DSH_HOME/skills/（默认 ~/.dsh/skills/）
              项目级 → <项目根>/.claude/skills/ 或 <项目根>/.dsh/skills/
 2. 把仓库克隆到技能目录，目录名必须是 dut-thesis-formatter
@@ -75,11 +76,15 @@
 
 先确认你的工具用哪个技能目录：
 
-| 工具 | 用户级 | 项目级 |
+| 工具 | 用户级技能目录 | 项目级 |
 |---|---|---|
 | Claude Code | `~/.claude/skills/` | `<项目>/.claude/skills/` |
-| DeepSeek Harness | `$DSH_HOME/skills/`（默认 `~/.dsh/skills/`） | `<项目>/.dsh/skills/` |
+| Codex | `$CODEX_HOME/skills/` | 用用户级 |
+| DeepSeek Harness | `$DSH_HOME/skills/` | `<项目>/.dsh/skills/` |
 | 其它工具 | 查该工具的 skills / extensions 配置 | 同上 |
+
+> `$CODEX_HOME` 默认 `~/.codex`，`$DSH_HOME` 默认 `~/.dsh`。
+> 也就是说 Codex 默认是 `~/.codex/skills/`，DSH 默认是 `~/.dsh/skills/`。
 
 ```bash
 # 把 <技能目录> 换成上表对应的一列
@@ -89,7 +94,21 @@ git clone https://github.com/chen-xing512/DUT-thesis-formatter.git \
 # 例：Claude Code 用户级
 git clone https://github.com/chen-xing512/DUT-thesis-formatter.git \
   ~/.claude/skills/dut-thesis-formatter
+
+# 例：Codex 用户级
+git clone https://github.com/chen-xing512/DUT-thesis-formatter.git \
+  ~/.codex/skills/dut-thesis-formatter
 ```
+
+#### Codex 补充说明
+
+Codex 会扫描 `$CODEX_HOME/skills/<技能名>/SKILL.md`，所以上面这条 `git clone`
+就是完整安装步骤，克隆完**下一轮对话即可用**。
+
+Codex 自带 `skill-installer`，但它的 `--path` 只接受**仓库内的子目录**
+（`--path .` 会报 `Invalid skill name`）。本仓库的 `SKILL.md` 在**仓库根目录**，
+因此无法直接喂给它；用 `git clone` 即可。若你的 Codex 版本支持子目录形态，
+也可以 `--path dut-thesis-formatter`，但需仓库把技能放进同名子目录。
 
 装完确认：
 
@@ -135,6 +154,8 @@ soffice --headless --convert-to pdf --outdir . 论文_DUT.docx
 ```bash
 pip install python-docx
 ```
+
+**Python ≥ 3.9**（已在 3.9 与 3.12 上实测通过；CI 用 3.11）。
 
 `python-docx` 是**唯一**必需依赖。生成 `docs/demo.png` 才需要 matplotlib：
 
@@ -209,6 +230,8 @@ dut-thesis-formatter/
 ```
 
 ## 规范来源与优先级
+
+本 skill 借助 DeepSeek Flash 生成，并参考了 [Gorilla-Kevv/scnu-thesis-formatter](https://github.com/Gorilla-Kevv/scnu-thesis-formatter) 项目。
 
 规则提炼自大连理工大学研究生院《大连理工大学硕士学位论文格式规范》（2026-04-15 版），
 并交叉核对了官方 Word 模板的样式定义（`摘要题目` / `图名中文` / `参考文献正文` / `公式` 等

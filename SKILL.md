@@ -29,8 +29,12 @@ license: MIT
 1. **先确定技能目录**，拿不准就把候选路径列给用户确认。
    常见约定：
    - Claude Code：`~/.claude/skills/`（用户级）、`<项目>/.claude/skills/`（项目级）
+   - Codex：`$CODEX_HOME/skills/`（默认 `~/.codex/skills/`）
    - DeepSeek Harness：`$DSH_HOME/skills/`（默认 `~/.dsh/skills/`）、`<项目>/.dsh/skills/`
    - 其它工具：查它的 skills / extensions 配置
+
+   注意：本仓库的 `SKILL.md` 在**仓库根目录**，Codex 自带的 `skill-installer`
+   （`--path` 只接受子目录）装不了，Codex 请直接用 `git clone`。
 2. **克隆时目录名必须是 `dut-thesis-formatter`**，与 `SKILL.md` 里
    frontmatter 的 `name:` 严格一致，否则有的工具加载不到。已存在同名目录时先问用户。
 3. **装依赖**到本 Agent 实际使用的解释器：`pip install python-docx`
