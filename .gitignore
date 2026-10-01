@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+build/
+
+# 打包产物
+*.skill
+dist/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+
+# 本地渲染产物（可随时用脚本重建）
+docs/showcase.docx
+docs/showcase.pdf
+docs/cover_demo.docx
+docs/cover_demo.pdf
+docs/cover_borders.docx
+docs/cover_borders.pdf
