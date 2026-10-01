@@ -3,6 +3,8 @@
 把中文论文草稿的 `.docx` **就地改写**为符合《大连理工大学硕士学位论文格式规范》的成品。
 也可从零生成符合规范的论文骨架，或对任意 `.docx` 做格式体检。
 
+本 skill 借助 DeepSeek Flash 生成，并参考了 @Gorilla-Kevv/scnu-thesis-formatter 项目。
+
 ![DUT 格式排版效果与关键规范值](docs/demo.png)
 
 > 上图是 **Word 真实渲染结果**（不是示意图）：封面、中文摘要、正文首页、含三线表的正文页，
