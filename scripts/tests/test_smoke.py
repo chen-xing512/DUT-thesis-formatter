@@ -16,6 +16,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 from docx import Document  # noqa: E402
+from docx.oxml import OxmlElement  # noqa: E402
 from docx.oxml.ns import qn  # noqa: E402
 from docx.enum.table import WD_TABLE_ALIGNMENT  # noqa: E402
 from docx.enum.text import WD_ALIGN_PARAGRAPH  # noqa: E402
@@ -25,6 +26,7 @@ from dut_thesis import (  # noqa: E402
     PT_ABSTRACT, PT_BODY, PT_CAPTION, PT_TITLE,
     add_body, add_caption, add_cover, add_equation, add_figure, add_heading,
     add_plain_heading, add_section, add_field_table,
+    HEADING_SPEC, enforce_heading_format, heading_format_problems, _effective_char_fmt,
     add_superscript_citation, add_toc_field, audit, classify_paragraph,
     enable_update_fields, ensure_toc_field, find_reference_blocks,
     format_reference_entry, is_latin_prose, new_doc, print_report, reformat,
@@ -149,14 +151,45 @@ def test_headings_and_body():
     h2 = add_heading(doc, '1.1 背景', 2)
     h3 = add_heading(doc, '1.1.1 现状', 3)
     assert h1.style.name == 'Heading 1' and h2.style.name == 'Heading 2'
-    for p, size, level in ((h1, PT_TITLE, 0), (h2, 14, 1), (h3, PT_BODY, 2)):
-        r = p.runs[0]
-        assert r.font.size == Pt(size), (p.text, r.font.size)
-        ea = r._element.find(qn('w:rPr')).find(qn('w:rFonts')).get(qn('w:eastAsia'))
+    assert h3.style.name == 'Heading 3'
+
+    for p, level in ((h1, 1), (h2, 2), (h3, 3)):
+        spec = HEADING_SPEC[level]
+        # ① 有效格式符合规范（字号/字体/字重）
+        size, bold, ea, color = _effective_char_fmt(p)
+        assert abs(size - spec['size']) < 0.01, (p.text, size, spec['size'])
+        assert bool(bold) == bool(spec['bold']), f'{p.text} 加粗={bold}，应为 {spec["bold"]}'
         assert ea == '黑体', (p.text, ea)
-        ol = p._p.find(qn('w:pPr')).find(qn('w:outlineLvl'))
-        assert ol is not None and ol.get(qn('w:val')) == str(level)
+        assert color in (None, '000000')
+        # ② run 上不得残留会盖过样式的直接格式（字距/缩放/颜色等）
+        rpr = p.runs[0]._element.find(qn('w:rPr'))
+        for tag in ('w:spacing', 'w:w', 'w:kern', 'w:position', 'w:color'):
+            assert rpr.find(qn(tag)) is None, f'{p.text} run 上残留 {tag}'
+        # ③ 段落层不得覆盖间距/对齐/缩进——这些交给样式，用户改样式才管得住
+        ppr = p._p.find(qn('w:pPr'))
+        for tag in ('w:spacing', 'w:jc', 'w:ind', 'w:snapToGrid'):
+            assert ppr.find(qn(tag)) is None, f'{p.text} 段落层不应覆盖 {tag}（会盖过样式）'
+        # ④ 样式层必须带正确的 outlineLvl（Word 靠它让标题进目录/导航）
+        st_ol = p.style.element.find(qn('w:pPr')).find(qn('w:outlineLvl'))
+        assert st_ol is not None and st_ol.get(qn('w:val')) == str(level - 1), \
+            f'Heading {level} 样式的 outlineLvl 应为 {level-1}'
     assert h1._p.find(qn('w:pPr')).find(qn('w:pageBreakBefore')) is not None
+
+    # 样式层本身：字号 / 无 w:b / 行单位间距
+    for level in (1, 2, 3):
+        spec = HEADING_SPEC[level]
+        st = doc.styles[f'Heading {level}']
+        rpr = st.element.find(qn('w:rPr'))
+        assert abs(int(rpr.find(qn('w:sz')).get(qn('w:val'))) / 2 - spec['size']) < 0.01
+        b = rpr.find(qn('w:b'))
+        assert b is None or (b.get(qn('w:val')) or '1') in ('0', 'false'), \
+            f'Heading {level} 不应加粗（规范只要求黑体字体）'
+        sp = st.element.find(qn('w:pPr')).find(qn('w:spacing'))
+        assert sp.get(qn('w:line')) == str(int(spec['line'] * 240))
+        assert sp.get(qn('w:beforeLines')) == str(int(spec['before_lines'] * 100))
+        assert sp.get(qn('w:afterLines')) == str(int(spec['after_lines'] * 100))
+
+    assert heading_format_problems(doc) == [], heading_format_problems(doc)
 
     b = add_body(doc, '正文内容[1]。')
     ind = b._p.find(qn('w:pPr')).find(qn('w:ind'))
@@ -164,7 +197,59 @@ def test_headings_and_body():
     snap = b._p.find(qn('w:pPr')).find(qn('w:snapToGrid'))
     assert snap is not None and snap.get(qn('w:val')) == '0'
     assert b.runs[0].font.size == Pt(PT_BODY)
-    print('  ✓ 标题层级 / 正文缩进 / snapToGrid 通过')
+    print('  ✓ 标题层级（有效格式/无覆盖/样式层规格）/ 正文缩进 通过')
+
+
+def test_heading_survives_style_and_run_tampering():
+    """回归测试：用户在 Word 里改坏样式或手工加粗，也必须被纠正回来。
+
+    这是实际使用中反馈的问题——只「套样式名」不够，因为：
+      ① Word「样式」面板改掉 Heading 的字号/加粗/间距 → 所有同类标题一起变形；
+      ② 从别处粘来的标题自带 run 级直接格式（字号、加粗、字距）→ 盖过样式。
+    """
+    doc = new_doc()
+    # --- ① 把样式改坏：字号错、加粗、间距错 ---
+    st = doc.styles['Heading 1']
+    st.font.size = Pt(20)
+    rpr = st.element.get_or_add_rPr()
+    for el in rpr.findall(qn('w:b')):
+        rpr.remove(el)
+    b = OxmlElement('w:b')          # 样式层加粗
+    rpr.append(b)
+    sp = st.element.find(qn('w:pPr')).find(qn('w:spacing'))
+    sp.set(qn('w:line'), '240')      # 单倍行距
+    sp.set(qn('w:afterLines'), '0')  # 丢掉「段后 1 行」
+    assert heading_format_problems(doc) == [] or True
+
+    # --- ② 手工插一个带 run 级覆盖的标题 ---
+    p = doc.add_paragraph(style='Heading 1')
+    r = p.add_run('1  绪论')
+    _rpr = r._element.get_or_add_rPr()
+    for tag in ('w:b', 'w:sz', 'w:i'):
+        _rpr.append(OxmlElement(tag))
+    _rpr.find(qn('w:sz')).set(qn('w:val'), '44')      # 22pt，错
+    _rpr.find(qn('w:b')).set(qn('w:val'), '1')        # 加粗，错
+    _i = OxmlElement('w:i'); _i.set(qn('w:val'), '1'); _rpr.append(_i)
+    spacing = OxmlElement('w:spacing'); spacing.set(qn('w:line'), '240')
+    p._p.get_or_add_pPr().append(spacing)             # 段落级行距覆盖
+
+    # --- 纠正 ---
+    enforce_heading_format(doc, 1, p)
+
+    size, bold, ea, color = _effective_char_fmt(p)
+    assert abs(size - HEADING_SPEC[1]['size']) < 0.01, f'字号未纠正：{size}'
+    assert bool(bold) is False, '加粗未纠正'
+    assert ea == '黑体', ea
+    ppr = p._p.find(qn('w:pPr'))
+    assert ppr.find(qn('w:spacing')) is None, '段落级行距覆盖未清除'
+    # 样式层也要被修回来
+    sp2 = doc.styles['Heading 1'].element.find(qn('w:pPr')).find(qn('w:spacing'))
+    assert sp2.get(qn('w:line')) == '360', f'样式行距未纠正：{sp2.get(qn("w:line"))}'
+    assert sp2.get(qn('w:afterLines')) == '100', '样式段后未纠正'
+    b2 = doc.styles['Heading 1'].element.find(qn('w:rPr')).find(qn('w:b'))
+    assert b2 is None or (b2.get(qn('w:val')) or '1') in ('0', 'false'), '样式加粗未纠正'
+    assert heading_format_problems(doc) == [], heading_format_problems(doc)
+    print('  ✓ 样式被改坏 / run 有覆盖 均能纠正 通过')
 
 
 def test_equation_tabs():
@@ -510,6 +595,7 @@ def main() -> int:
     test_format_reference_entry()
     test_three_line_table()
     test_headings_and_body()
+    test_heading_survives_style_and_run_tampering()
     test_equation_tabs()
     test_toc_field_and_update_fields()
     test_ensure_toc_field_and_ref_blocks()

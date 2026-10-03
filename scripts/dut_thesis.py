@@ -113,6 +113,25 @@ PT_PAGENUM = FONT_SIZE['小五']   # 9   页码
 LINE_BODY = 1.25        # 正文多倍行距
 LINE_HEADING = 1.5      # 标题行距
 
+#: 三级标题的**权威规格**——样式层、段落层、校验层都从这里取，避免三处各写一份而对不上。
+#:
+#: 取值依据是官方模板 `大连理工大学硕士学位论文格式规范.docx` 的样式定义
+#: （直接读它的 ``w:rPr`` / ``w:pPr`` 得到），要点：
+#:
+#: * **不加粗**。规范文字只说「黑体」——那是**字体名**（SimHei），
+#:   官方模板的 Heading 1/2/3 都**没有** ``w:b``（只有 ``w:bCs``，那是复杂文种用的）。
+#:   黑体本身笔画已经够重，再加 ``w:b`` 会变成合成粗体，和模板不一致。
+#: * ``sz`` 单位是半磅，所以三号 16pt → ``32``；Heading 3 官方**不写 sz**，
+#:   直接继承 Normal 的 24（小四 12pt）。
+#: * 行距 ``line=360 lineRule=auto``（360/240 = 1.5 倍），段前/段后用 ``*Lines``
+#:   表达「0.5 行 / 1 行」的行单位。
+HEADING_SPEC = {
+    #     字号        加粗    段前(行)  段后(行)  行距
+    1: dict(size=PT_TITLE,   bold=False, before_lines=0.0, after_lines=1.0, line=LINE_HEADING),
+    2: dict(size=PT_SECTION, bold=False, before_lines=0.5, after_lines=0.0, line=LINE_HEADING),
+    3: dict(size=PT_BODY,    bold=False, before_lines=0.5, after_lines=0.0, line=LINE_HEADING),
+}
+
 #: 版心宽度（cm）—— A4 21cm − 左右各 2.5cm
 PAGE_W_CM = 21.0
 TEXT_W_CM = 16.0
@@ -144,6 +163,19 @@ def set_run(run, cn: str = SONG, en: str = EN_FONT, size: float = PT_BODY,
     run.font.bold = bold
     run.font.italic = italic
     run.font.underline = underline
+    # python-docx 里 font.bold=False 会**删除** <w:b>，而 Word 的语义是
+    # 「标签存在即为真」——删掉就退回继承。所以显式写 val="0" 把字重钉死。
+    _rpr = run._element.get_or_add_rPr()
+    for _tag in ('w:b', 'w:i', 'w:u'):
+        for _el in _rpr.findall(qn(_tag)):
+            _rpr.remove(_el)
+    for _tag, _flag in (('w:b', bold), ('w:i', italic)):
+        _el = OxmlElement(_tag)
+        _el.set(qn('w:val'), '1' if _flag else '0')
+        _rpr.append(_el)
+    _u = OxmlElement('w:u')
+    _u.set(qn('w:val'), 'single' if underline else 'none')
+    _rpr.append(_u)
     if superscript:
         run.font.superscript = True
     if color is not None:
@@ -309,28 +341,28 @@ def add_body(doc, text: str, before: float = 0, after: float = 0,
 
 
 def add_heading(doc, text: str, level: int, toc: bool = True, page_break: bool = False):
-    """章/节/小节标题。
+    """章 / 节 / 小节标题。格式取自 :data:`HEADING_SPEC`（依据官方模板）：
 
-    * level 1 → 黑体三号居左，段后 1 行，outline 0（章）
-    * level 2 → 黑体四号居左，段前 0.5 行，outline 1（节）
-    * level 3 → 黑体小四居左，段前 0.5 行，outline 2（小节）
+    * level 1 → 黑体三号 **不加粗** 居左，段后 1 行，outline 0（章）
+    * level 2 → 黑体四号 **不加粗** 居左，段前 0.5 行，outline 1（节）
+    * level 3 → 黑体小四 **不加粗** 居左，段前 0.5 行，outline 2（小节）
     * ``toc=False`` → outline 9（不进目录）
+
+    注意「黑体」是**字体名**（SimHei），规范并未要求再加粗；
+    官方模板的 Heading 1/2/3 都没有 ``w:b``。多加深粗会变成合成粗体，与模板不一致。
     """
     if level not in (1, 2, 3):
         raise ValueError('level 必须是 1/2/3')
-    style = f'Heading {level}'
-    p = doc.add_paragraph(style=style)
-    size = {1: PT_TITLE, 2: PT_SECTION, 3: PT_BODY}[level]
-    before = {1: 0, 2: 6, 3: 6}[level]
-    after = {1: 12, 2: 0, 3: 0}[level]
-    set_run(p.add_run(text), cn=HEI, en=EN_FONT, size=size, bold=True)
-    fmt_para(p, align=WD_ALIGN_PARAGRAPH.LEFT, line=LINE_HEADING,
-             before=before, after=after, snap_to_grid=False)
-    _set_ind(p, left=0, firstLineChars=0, firstLine=0)
-    set_outline(p, (level - 1) if toc else 9)
+    spec = HEADING_SPEC[level]
+    p = doc.add_paragraph(style=f'Heading {level}')
+    p.add_run(text)
     set_keep_with_next(p, True)
     if page_break:
         set_page_break_before(p, True)
+    # 间距/对齐/缩进/大纲交给样式，段落层不再覆盖；并校验样式本身
+    enforce_heading_format(doc, level, p)
+    if not toc:
+        set_outline(p, 9)      # 目录标题不进目录，这是样式里没有的意图
     return p
 
 
@@ -765,16 +797,504 @@ def _style_rpr(style):
     return style.element.get_or_add_rPr()
 
 
+#: 会**盖过样式**的字符级属性。命名样式只是继承基线，run 上只要有这些就直接生效。
+_OVERRIDE_RPR_TAGS = (
+    'w:sz', 'w:szCs',            # 字号：最大嫌疑
+    'w:b', 'w:bCs', 'w:i', 'w:iCs',
+    'w:rFonts', 'w:color',       # 字体 / 颜色
+    'w:spacing', 'w:w', 'w:kern', 'w:position',   # 字距 / 缩放 / 字偶距 / 上下移
+    'w:u', 'w:strike', 'w:dstrike', 'w:shd', 'w:highlight', 'w:emboss',
+    'w:imprint', 'w:outline', 'w:vanish', 'w:smallCaps', 'w:caps', 'w:effect',
+)
+
+#: 上面那些里**允许**留在 run 上的。``w:rFonts`` 必须逐个 run 写：
+#: 中西文分属两个字体槽（``w:eastAsia`` / ``w:ascii``），样式层给了也可能被
+#: run 的旧字体覆盖，而它不属于「会改变字号字重的坏覆盖」，故白名单放行。
+_OVERRIDE_ALLOWED = ('w:rFonts',)
+
+
+def strip_char_overrides(para, keep_bold: bool | None = None):
+    """剥掉段落内所有 run 的**字符级直接格式**，让样式成为唯一来源。
+
+    命名样式只是「继承基线」：run 上任何直接格式都优先于样式。用户从别处
+    粘一段标题进来、或手动加粗/改字号，样式就形同虚设。所以套样式之后
+    必须把这些覆盖清掉，渲染才真正听规范的。
+
+    :param keep_bold: ``None`` 时保留现有粗体设置（只清字号字体等）；
+        给 ``True``/``False`` 则连 ``w:b`` 一起定型。
+    """
+    for r in para.runs:
+        rpr = r._element.find(qn('w:rPr'))
+        if rpr is None:
+            continue
+        for tag in _OVERRIDE_RPR_TAGS:
+            if tag in ('w:b', 'w:bCs') and keep_bold is not None:
+                continue
+            for el in rpr.findall(qn(tag)):
+                rpr.remove(el)
+        if keep_bold is not None:
+            for tag in ('w:b', 'w:bCs'):
+                for el in rpr.findall(qn(tag)):
+                    rpr.remove(el)
+                if keep_bold:
+                    rpr.append(OxmlElement(tag))
+    return para
+
+
+def _effective_char_fmt(para):
+    """返回段落首个 run 的**有效**字符格式 ``(size_pt, bold, eastAsia, color)``。
+
+    先看 run 的直接格式，没有则回落到它的段落样式，再看样式的 basedOn 链。
+    """
+    def _from_rpr(rpr):
+        if rpr is None:
+            return {}
+        out = {}
+        sz = rpr.find(qn('w:sz'))
+        if sz is not None:
+            try:
+                out['size'] = int(sz.get(qn('w:val'))) / 2.0
+            except (TypeError, ValueError):
+                pass
+        _b = rpr.find(qn('w:b'))
+        if _b is not None:
+            _v = (_b.get(qn('w:val')) or '1').lower()
+            out['bold'] = _v not in ('0', 'false', 'off')
+        # 没有 w:b 时不写 bold，留给继承链决定
+        rf = rpr.find(qn('w:rFonts'))
+        if rf is not None and rf.get(qn('w:eastAsia')):
+            out['eastAsia'] = rf.get(qn('w:eastAsia'))
+        c = rpr.find(qn('w:color'))
+        if c is not None:
+            out['color'] = (c.get(qn('w:val')) or '').upper()
+        return out
+
+    run = para.runs[0] if para.runs else None
+    direct = _from_rpr(run._element.find(qn('w:rPr'))) if run is not None else {}
+
+    st = para.style
+    chain = []
+    while st is not None:
+        chain.append(st)
+        try:
+            st = st.base_style
+        except Exception:
+            st = None
+        if len(chain) > 10:
+            break
+    merged = {}
+    for style in reversed(chain):          # 从最根上的 Normal 往下盖
+        merged.update(_from_rpr(style.element.find(qn('w:rPr'))))
+    merged.update(direct)                  # 直接格式优先级最高
+    return (merged.get('size'), merged.get('bold'),
+            merged.get('eastAsia'), merged.get('color'))
+
+
+def enforce_heading_format(doc, level: int, para=None):
+    """确保标题**渲染出来**就是规范的样子，而不只是「套了样式」。
+
+    三步走，对应三种会被用户改坏的地方：
+
+    1. **样式层**——调 :func:`ensure_heading_style`，纠正 Word 样式面板里
+       被改过的字号/加粗/间距（改样式会让所有同类标题一起变形）；
+    2. **字符层**——:func:`strip_char_overrides` 清掉 run 上的直接格式
+       （字号、加粗、字体、字距……），并把粗体按规范定型；
+    3. **段落层**——删掉 ``w:spacing`` / ``w:jc`` / ``w:ind`` / ``w:snapToGrid``
+       / ``w:outlineLvl`` 的段落级覆盖，让间距对齐回到样式；
+       只保留 ``w:pageBreakBefore``（章前分页）这类样式里没有的意图。
+
+    ``para=None`` 时只修样式（用于建文档阶段），随后新建的段落自然会正确。
+    """
+    spec = HEADING_SPEC[level]
+    ensure_heading_style(doc, level)
+
+    if para is None:
+        return None
+
+    # --- 样式套用（若当前不是该 Heading 样式，先套上）---
+    want_style = f'Heading {level}'
+    if para.style.name != want_style:
+        try:
+            para.style = doc.styles[want_style]
+        except KeyError:
+            pass
+    # --- 字符层：**清掉一切直接格式**，只把中/西文字体名写回去 ---
+    #
+    # 为什么字号/字重/颜色不写在 run 上：三者样式层已经有了（见 ensure_heading_style），
+    # run 上再写一份就是「直接格式压过样式」——用户之后在 Word 样式面板里改字号
+    # 会发现改不动，因为 run 那份更优先。让样式成为唯一来源，才既符合规范又受管制。
+    strip_char_overrides(para, keep_bold=bool(spec['bold']))
+    for r in para.runs:
+        _rpr = r._element.get_or_add_rPr()
+        for _tag in ('w:sz', 'w:szCs', 'w:b', 'w:bCs', 'w:i', 'w:iCs',
+                     'w:color', 'w:u', 'w:spacing', 'w:w', 'w:kern', 'w:position'):
+            for _el in _rpr.findall(qn(_tag)):
+                _rpr.remove(_el)
+        _rf = _rpr.get_or_add_rFonts()
+        _rf.set(qn('w:ascii'), EN_FONT)
+        _rf.set(qn('w:hAnsi'), EN_FONT)
+        _rf.set(qn('w:eastAsia'), HEI)
+        _rf.set(qn('w:cs'), EN_FONT)
+    # --- 段落层：让间距/对齐/缩进回到样式 ---
+    ppr = para._p.get_or_add_pPr()
+    for tag in ('w:spacing', 'w:jc', 'w:ind', 'w:snapToGrid', 'w:outlineLvl'):
+        for el in ppr.findall(qn(tag)):
+            ppr.remove(el)
+    return para
+
+
+def heading_format_problems(doc) -> list:
+    """检查所有标题的**有效格式**是否符合 :data:`HEADING_SPEC`。
+
+    只看结果、不看过程：无论问题出在样式被改、还是 run 上有覆盖，
+    只要最终字号/加粗/字体/颜色/对齐/大纲级别不对，就报出来。
+    """
+    problems = []
+    for i, para in enumerate(doc.paragraphs):
+        sn = para.style.name if para.style is not None else ''
+        if not (sn.startswith('Heading') and sn.split()[-1].isdigit()):
+            continue
+        level = int(sn.split()[-1])
+        if level not in HEADING_SPEC or not para.text.strip():
+            continue
+        spec = HEADING_SPEC[level]
+        size, bold, ea, color = _effective_char_fmt(para)
+        label = f'第{i}段 {para.text[:14]!r}'
+        if size is None or abs(size - spec['size']) > 0.01:
+            problems.append(f'{label} 字号 {size}，应为 {spec["size"]}pt')
+        if bool(bold) != bool(spec['bold']):
+            problems.append(f'{label} 加粗 {bold}，应为 {spec["bold"]}（规范只要求黑体字体，不加粗）')
+        if ea != HEI:
+            problems.append(f'{label} 中文字体 {ea!r}，应为 {HEI!r}')
+        if color not in (None, '000000', 'AUTO'):
+            problems.append(f'{label} 颜色 #{color}，应为黑色')
+        ppr = para._p.find(qn('w:pPr'))
+        if ppr is not None:
+            jc = ppr.find(qn('w:jc'))
+            if jc is not None and jc.get(qn('w:val')) != 'left':
+                problems.append(f'{label} 段落对齐 {jc.get(qn("w:val"))}，应为 left')
+            ol = ppr.find(qn('w:outlineLvl'))
+            if ol is not None and ol.get(qn('w:val')) != str(level - 1):
+                problems.append(f'{label} 大纲级别 {ol.get(qn("w:val"))}，应为 {level - 1}')
+        # 段落级的字符覆盖（样式之外的直接格式）
+        for r in para.runs:
+            rpr = r._element.find(qn('w:rPr'))
+            if rpr is None:
+                continue
+            leftover = [t.split(':')[1] for t in _OVERRIDE_RPR_TAGS
+                        if t not in _OVERRIDE_ALLOWED and rpr.find(qn(t)) is not None]
+            if leftover:
+                problems.append(f'{label} run 上残留直接格式 {leftover}（会盖过样式）')
+                break
+    return problems
+
+
+def ensure_heading_style(doc, level: int):
+    """把 ``Heading <level>`` 样式**修正**到 :data:`HEADING_SPEC`，返回是否改动过。
+
+    为什么不能只在建文档时设一次：Word 的「样式」面板里，用户（或从别处粘进来的
+    内容）随时能改掉样式本身的字号/加粗/间距；一旦样式被改，
+    **所有套用该样式的标题会一起变形**，而段落层看不出来。
+
+    实现上**一次性把规范值全部写全**，不做「按需局部修正」——
+    因为 ``ensure_style`` 形如 ``size=PT_BODY, line=LINE_BODY`` 都带默认值，
+    只传其中一两个参数去「局部修」时，**没传的字段会被默默重置成默认值**。
+    曾经因此出现「修字体时把刚修好的字号打回 12pt」的连环 bug。
+    """
+    spec = HEADING_SPEC[level]
+    name = f'Heading {level}'
+    st = doc.styles[name]
+
+    # 先确保它是个段落样式（名字可能被同名 Character 样式占着）
+    if st.type != WD_STYLE_TYPE.PARAGRAPH:
+        st.name = f'{name} (字符样式)'
+        st = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+
+    # 基础属性一次性写全
+    ensure_style(doc, name, based_on='Normal', cn=HEI, en=EN_FONT,
+                 size=spec['size'], bold=spec['bold'], align=WD_ALIGN_PARAGRAPH.LEFT,
+                 line=spec['line'], line_rule='auto',
+                 before_lines=spec['before_lines'], after_lines=spec['after_lines'],
+                 first_line_chars_=0, outline=level - 1)
+
+    # ensure_style 只会写 w:b=True，不会主动删；这里按规范显式定型字重
+    rpr = st.element.get_or_add_rPr()
+    for tag in ('w:b', 'w:bCs', 'w:i', 'w:iCs'):
+        for el in rpr.findall(qn(tag)):
+            rpr.remove(el)
+    if spec['bold']:
+        rpr.append(OxmlElement('w:b'))
+    # 颜色钉成黑色（python-docx 内置模板的标题自带主题蓝）
+    strip_style_color(st, (0, 0, 0))
+
+    # 章标题前的分页是**样式里没有的意图**，不能由样式给（否则所有 Heading 1
+    # 都强制分页，附录/参考文献那种居中标题也会被带上）。这里清掉任何残留。
+    ppr = st.element.get_or_add_pPr()
+    for el in ppr.findall(qn('w:pageBreakBefore')):
+        ppr.remove(el)
+    return changed_style(st, level)
+
+
+def _style_signature(st, level: int):
+    """取样式的「规格指纹」，用于判断是否需要修正。"""
+    spec = HEADING_SPEC[level]
+    rpr = st.element.find(qn('w:rPr'))
+    ppr = st.element.find(qn('w:pPr'))
+    def _f(parent, tag):
+        return None if parent is None else parent.find(qn(tag))
+
+    rf, sz, b, c = _f(rpr, 'w:rFonts'), _f(rpr, 'w:sz'), _f(rpr, 'w:b'), _f(rpr, 'w:color')
+    sp, ol, jc = _f(ppr, 'w:spacing'), _f(ppr, 'w:outlineLvl'), _f(ppr, 'w:jc')
+    # 字重归一化：没有 w:b（继承）与 w:b val="0"（显式关闭）在「是否加粗」上等价，
+    # 都算不加粗。只有真的要求加粗时才算 True——否则「缺省」会被误报成不符。
+    bold_val = False
+    if b is not None:
+        bold_val = (b.get(qn('w:val')) or '1').lower() not in ('0', 'false', 'off')
+    return (
+        int(sz.get(qn('w:val'))) / 2.0 if sz is not None else None,
+        bold_val,
+        rf.get(qn('w:eastAsia')) if rf is not None else None,
+        (c.get(qn('w:val')) or '').upper() if c is not None else None,
+        sp.get(qn('w:line')) if sp is not None else None,
+        sp.get(qn('w:beforeLines')) if sp is not None else None,
+        sp.get(qn('w:afterLines')) if sp is not None else None,
+        jc.get(qn('w:val')) if jc is not None else None,
+        ol.get(qn('w:val')) if ol is not None else None,
+    )
+
+
+def _wanted_signature(level: int):
+    spec = HEADING_SPEC[level]
+    return (
+        float(spec['size']),
+        bool(spec['bold']),
+        HEI,
+        '000000',
+        str(int(spec['line'] * 240)),
+        str(int(spec['before_lines'] * 100)),
+        str(int(spec['after_lines'] * 100)),
+        'left',
+        str(level - 1),
+    )
+
+
+def changed_style(st, level: int) -> bool:
+    """样式是否与规范不符（不符就该修）。"""
+    try:
+        return _style_signature(st, level) != _wanted_signature(level)
+    except Exception:
+        return True
+
+
+#: 会**盖过样式**的字符级属性。命名样式只是继承基线，run 上只要有这些就直接生效。
+_OVERRIDE_RPR_TAGS = (
+    'w:sz', 'w:szCs',            # 字号：最大嫌疑
+    'w:b', 'w:bCs', 'w:i', 'w:iCs',
+    'w:rFonts', 'w:color',       # 字体 / 颜色
+    'w:spacing', 'w:w', 'w:kern', 'w:position',   # 字距 / 缩放 / 字偶距 / 上下移
+    'w:u', 'w:strike', 'w:dstrike', 'w:shd', 'w:highlight', 'w:emboss',
+    'w:imprint', 'w:outline', 'w:vanish', 'w:smallCaps', 'w:caps', 'w:effect',
+)
+
+#: 上面那些里**允许**留在 run 上的。``w:rFonts`` 必须逐个 run 写：
+#: 中西文分属两个字体槽（``w:eastAsia`` / ``w:ascii``），样式层给了也可能被
+#: run 的旧字体覆盖，而它不属于「会改变字号字重的坏覆盖」，故白名单放行。
+_OVERRIDE_ALLOWED = ('w:rFonts',)
+
+
+def strip_char_overrides(para, keep_bold: bool | None = None):
+    """剥掉段落内所有 run 的**字符级直接格式**，让样式成为唯一来源。
+
+    命名样式只是「继承基线」：run 上任何直接格式都优先于样式。用户从别处
+    粘一段标题进来、或手动加粗/改字号，样式就形同虚设。所以套样式之后
+    必须把这些覆盖清掉，渲染才真正听规范的。
+
+    :param keep_bold: ``None`` 时保留现有粗体设置（只清字号字体等）；
+        给 ``True``/``False`` 则连 ``w:b`` 一起定型。
+    """
+    for r in para.runs:
+        rpr = r._element.find(qn('w:rPr'))
+        if rpr is None:
+            continue
+        for tag in _OVERRIDE_RPR_TAGS:
+            if tag in ('w:b', 'w:bCs') and keep_bold is not None:
+                continue
+            for el in rpr.findall(qn(tag)):
+                rpr.remove(el)
+        if keep_bold is not None:
+            for tag in ('w:b', 'w:bCs'):
+                for el in rpr.findall(qn(tag)):
+                    rpr.remove(el)
+                if keep_bold:
+                    rpr.append(OxmlElement(tag))
+    return para
+
+
+def _effective_char_fmt(para):
+    """返回段落首个 run 的**有效**字符格式 ``(size_pt, bold, eastAsia, color)``。
+
+    先看 run 的直接格式，没有则回落到它的段落样式，再看样式的 basedOn 链。
+    """
+    def _from_rpr(rpr):
+        if rpr is None:
+            return {}
+        out = {}
+        sz = rpr.find(qn('w:sz'))
+        if sz is not None:
+            try:
+                out['size'] = int(sz.get(qn('w:val'))) / 2.0
+            except (TypeError, ValueError):
+                pass
+        _b = rpr.find(qn('w:b'))
+        if _b is not None:
+            _v = (_b.get(qn('w:val')) or '1').lower()
+            out['bold'] = _v not in ('0', 'false', 'off')
+        # 没有 w:b 时不写 bold，留给继承链决定
+        rf = rpr.find(qn('w:rFonts'))
+        if rf is not None and rf.get(qn('w:eastAsia')):
+            out['eastAsia'] = rf.get(qn('w:eastAsia'))
+        c = rpr.find(qn('w:color'))
+        if c is not None:
+            out['color'] = (c.get(qn('w:val')) or '').upper()
+        return out
+
+    run = para.runs[0] if para.runs else None
+    direct = _from_rpr(run._element.find(qn('w:rPr'))) if run is not None else {}
+
+    st = para.style
+    chain = []
+    while st is not None:
+        chain.append(st)
+        try:
+            st = st.base_style
+        except Exception:
+            st = None
+        if len(chain) > 10:
+            break
+    merged = {}
+    for style in reversed(chain):          # 从最根上的 Normal 往下盖
+        merged.update(_from_rpr(style.element.find(qn('w:rPr'))))
+    merged.update(direct)                  # 直接格式优先级最高
+    return (merged.get('size'), merged.get('bold'),
+            merged.get('eastAsia'), merged.get('color'))
+
+
+def enforce_heading_format(doc, level: int, para=None):
+    """确保标题**渲染出来**就是规范的样子，而不只是「套了样式」。
+
+    三步走，对应三种会被用户改坏的地方：
+
+    1. **样式层**——调 :func:`ensure_heading_style`，纠正 Word 样式面板里
+       被改过的字号/加粗/间距（改样式会让所有同类标题一起变形）；
+    2. **字符层**——:func:`strip_char_overrides` 清掉 run 上的直接格式
+       （字号、加粗、字体、字距……），并把粗体按规范定型；
+    3. **段落层**——删掉 ``w:spacing`` / ``w:jc`` / ``w:ind`` / ``w:snapToGrid``
+       / ``w:outlineLvl`` 的段落级覆盖，让间距对齐回到样式；
+       只保留 ``w:pageBreakBefore``（章前分页）这类样式里没有的意图。
+
+    ``para=None`` 时只修样式（用于建文档阶段），随后新建的段落自然会正确。
+    """
+    spec = HEADING_SPEC[level]
+    ensure_heading_style(doc, level)
+
+    if para is None:
+        return None
+
+    # --- 样式套用（若当前不是该 Heading 样式，先套上）---
+    want_style = f'Heading {level}'
+    if para.style.name != want_style:
+        try:
+            para.style = doc.styles[want_style]
+        except KeyError:
+            pass
+    # --- 字符层：**清掉一切直接格式**，只把中/西文字体名写回去 ---
+    #
+    # 为什么字号/字重/颜色不写在 run 上：三者样式层已经有了（见 ensure_heading_style），
+    # run 上再写一份就是「直接格式压过样式」——用户之后在 Word 样式面板里改字号
+    # 会发现改不动，因为 run 那份更优先。让样式成为唯一来源，才既符合规范又受管制。
+    strip_char_overrides(para, keep_bold=bool(spec['bold']))
+    for r in para.runs:
+        _rpr = r._element.get_or_add_rPr()
+        for _tag in ('w:sz', 'w:szCs', 'w:b', 'w:bCs', 'w:i', 'w:iCs',
+                     'w:color', 'w:u', 'w:spacing', 'w:w', 'w:kern', 'w:position'):
+            for _el in _rpr.findall(qn(_tag)):
+                _rpr.remove(_el)
+        _rf = _rpr.get_or_add_rFonts()
+        _rf.set(qn('w:ascii'), EN_FONT)
+        _rf.set(qn('w:hAnsi'), EN_FONT)
+        _rf.set(qn('w:eastAsia'), HEI)
+        _rf.set(qn('w:cs'), EN_FONT)
+    # --- 段落层：让间距/对齐/缩进回到样式 ---
+    ppr = para._p.get_or_add_pPr()
+    for tag in ('w:spacing', 'w:jc', 'w:ind', 'w:snapToGrid', 'w:outlineLvl'):
+        for el in ppr.findall(qn(tag)):
+            ppr.remove(el)
+    return para
+
+
+def heading_format_problems(doc) -> list:
+    """检查所有标题的**有效格式**是否符合 :data:`HEADING_SPEC`。
+
+    只看结果、不看过程：无论问题出在样式被改、还是 run 上有覆盖，
+    只要最终字号/加粗/字体/颜色/对齐/大纲级别不对，就报出来。
+    """
+    problems = []
+    for i, para in enumerate(doc.paragraphs):
+        sn = para.style.name if para.style is not None else ''
+        if not (sn.startswith('Heading') and sn.split()[-1].isdigit()):
+            continue
+        level = int(sn.split()[-1])
+        if level not in HEADING_SPEC or not para.text.strip():
+            continue
+        spec = HEADING_SPEC[level]
+        size, bold, ea, color = _effective_char_fmt(para)
+        label = f'第{i}段 {para.text[:14]!r}'
+        if size is None or abs(size - spec['size']) > 0.01:
+            problems.append(f'{label} 字号 {size}，应为 {spec["size"]}pt')
+        if bool(bold) != bool(spec['bold']):
+            problems.append(f'{label} 加粗 {bold}，应为 {spec["bold"]}（规范只要求黑体字体，不加粗）')
+        if ea != HEI:
+            problems.append(f'{label} 中文字体 {ea!r}，应为 {HEI!r}')
+        if color not in (None, '000000', 'AUTO'):
+            problems.append(f'{label} 颜色 #{color}，应为黑色')
+        ppr = para._p.find(qn('w:pPr'))
+        if ppr is not None:
+            jc = ppr.find(qn('w:jc'))
+            if jc is not None and jc.get(qn('w:val')) != 'left':
+                problems.append(f'{label} 段落对齐 {jc.get(qn("w:val"))}，应为 left')
+            ol = ppr.find(qn('w:outlineLvl'))
+            if ol is not None and ol.get(qn('w:val')) != str(level - 1):
+                problems.append(f'{label} 大纲级别 {ol.get(qn("w:val"))}，应为 {level - 1}')
+        # 段落级的字符覆盖（样式之外的直接格式）
+        for r in para.runs:
+            rpr = r._element.find(qn('w:rPr'))
+            if rpr is None:
+                continue
+            leftover = [t.split(':')[1] for t in _OVERRIDE_RPR_TAGS
+                        if t not in _OVERRIDE_ALLOWED and rpr.find(qn(t)) is not None]
+            if leftover:
+                problems.append(f'{label} run 上残留直接格式 {leftover}（会盖过样式）')
+                break
+    return problems
+
+
 def ensure_style(doc, name: str, style_id: str | None = None,
                  based_on: str = 'Normal', cn: str = SONG, en: str = EN_FONT,
                  size: float = PT_BODY, bold: bool = False, align=None,
-                 line: float = LINE_BODY, before: float = 0, after: float = 0,
+                 line: float = LINE_BODY, line_rule: str = 'auto',
+                 before: float = 0, after: float = 0,
+                 before_lines: float | None = None, after_lines: float | None = None,
                  first_line_chars_: int = 0, outline: int | None = None,
                  left: int = 0, hanging: int | None = None):
     """确保文档中存在 ``name`` 段落样式（不存在则创建），并设置其属性。
 
     改写既有文档时，把段落 ``p.style = doc.styles[name]`` 即可，
     这样在 Word 的样式面板里仍然可以整体调整。
+
+    :param line_rule: ``'auto'``（Word 默认，配合 ``w:line`` 表示倍数）或 ``'exact'``。
+    :param before_lines: 用**行**为单位的段前距（1 行 = 1.0），写 ``w:beforeLines``。
+        规范里的「段后 1 行」「段前 0.5 行」必须用行单位——按磅写死只对某一种
+        字号成立，标题字号一变就不是「1 行」了。给了它就忽略 ``before``。
     """
     try:
         st = doc.styles[name]
@@ -798,7 +1318,17 @@ def ensure_style(doc, name: str, style_id: str | None = None,
         pass
     st.font.name = en
     st.font.size = Pt(size)
-    st.font.bold = bold
+    # 同 set_run：显式写 w:b wal="0/1"，否则 False 会被 python-docx 当作「删除」，
+    # 结果样式没有 w:b（=不加粗）而检测却按「继承」判断，极易误判。
+    _srpr = st.element.get_or_add_rPr()
+    for _tag in ('w:b', 'w:bCs'):
+        for _el in _srpr.findall(qn(_tag)):
+            _srpr.remove(_el)
+    for _tag in ('w:b', 'w:bCs'):
+        _el = OxmlElement(_tag)
+        _el.set(qn('w:val'), '1' if bold else '0')
+        _srpr.append(_el)
+    # 注意：不要再碰 st.font.bold —— 它会把刚写好的 w:b 删掉
     rf = _style_rpr(st).get_or_add_rFonts()
     rf.set(qn('w:ascii'), en)
     rf.set(qn('w:hAnsi'), en)
@@ -811,6 +1341,20 @@ def ensure_style(doc, name: str, style_id: str | None = None,
     pf.line_spacing = line
     pf.space_before = Pt(before)
     pf.space_after = Pt(after)
+    # 行单位的段前/段后（w:beforeLines / w:afterLines，单位 1/100 行）
+    _ppr0 = st.element.get_or_add_pPr()
+    _sp0 = _ppr0.find(qn('w:spacing'))
+    if _sp0 is None:
+        _sp0 = OxmlElement('w:spacing')
+        _ppr0.append(_sp0)
+    _sp0.set(qn('w:lineRule'), line_rule)
+    _sp0.set(qn('w:line'), str(int(round(line * 240))))
+    if before_lines is not None:
+        _sp0.set(qn('w:beforeLines'), str(int(round(before_lines * 100))))
+        _sp0.set(qn('w:before'), str(int(round(before_lines * 12 * 20))))
+    if after_lines is not None:
+        _sp0.set(qn('w:afterLines'), str(int(round(after_lines * 100))))
+        _sp0.set(qn('w:after'), str(int(round(after_lines * 12 * 20))))
     # 段落样式里的 ind / outline 走 XML
     ppr = st.element.get_or_add_pPr()
     ind = ppr.find(qn('w:ind'))
@@ -882,13 +1426,20 @@ def apply_style_set(doc):
         ensure_style(doc, name, **kw)
         made.append(name)
 
-    # 三级标题样式
-    for lvl, size, before, after in ((1, PT_TITLE, 0, 12), (2, PT_SECTION, 6, 0),
-                                     (3, PT_BODY, 6, 0)):
+    # 三级标题样式——逐项按 HEADING_SPEC 落，含「不加粗」与「行单位」间距
+    for lvl in (1, 2, 3):
+        spec = HEADING_SPEC[lvl]
         name = f'Heading {lvl}'
-        ensure_style(doc, name, based_on='Normal', cn=HEI, size=size, bold=True,
-                     align=A.LEFT, line=LINE_HEADING, before=before, after=after,
+        ensure_style(doc, name, based_on='Normal', cn=HEI, size=spec['size'],
+                     bold=spec['bold'], align=A.LEFT, line=spec['line'],
+                     line_rule='auto', before_lines=spec['before_lines'],
+                     after_lines=spec['after_lines'],
                      first_line_chars_=0, outline=lvl - 1)
+        # ensure_style 只写 w:b=True，不会主动删；这里显式清掉残留的 w:b
+        rpr = doc.styles[name].element.get_or_add_rPr()
+        for tag in ('w:b', 'w:bCs'):
+            for el in rpr.findall(qn(tag)):
+                rpr.remove(el)
         made.append(name)
     return made
 
@@ -1640,18 +2191,13 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
             is_chapter = bool(_RE_CH1.match(text))
             for r in list(p.runs):
                 r._r.getparent().remove(r._r)
-            set_run(p.add_run(text), cn=HEI,
-                    en=EN_FONT, size=PT_TITLE, bold=True)
-            try:
-                p.style = doc.styles['Heading 1']
-            except KeyError:
-                pass
-            fmt_para(p, align=A.LEFT, line=LINE_HEADING, before=0, after=12,
-                     snap_to_grid=False)
-            _set_ind(p, left=0, firstLineChars=0, firstLine=0)
-            set_outline(p, 0)
+            spec = HEADING_SPEC[1]
+            set_run(p.add_run(text), cn=HEI, en=EN_FONT,
+                    size=spec['size'], bold=spec['bold'])
+            # 清掉 run 上的残留直接格式 + 段落级覆盖，并纠正样式本身
+            enforce_heading_format(doc, 1, p)
             set_keep_with_next(p, True)
-            if is_chapter and (first_h1_seen or True):
+            if is_chapter:
                 set_page_break_before(p, True)
                 stats['page_breaks'] += 1
             first_h1_seen = True
@@ -1662,16 +2208,10 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
             text = re.sub(r'\s+', ' ', p.text.strip())
             for r in list(p.runs):
                 r._r.getparent().remove(r._r)
-            set_run(p.add_run(text), cn=HEI,
-                    en=EN_FONT, size=PT_SECTION, bold=True)
-            try:
-                p.style = doc.styles['Heading 2']
-            except KeyError:
-                pass
-            fmt_para(p, align=A.LEFT, line=LINE_HEADING, before=6, after=0,
-                     snap_to_grid=False)
-            _set_ind(p, left=0, firstLineChars=0, firstLine=0)
-            set_outline(p, 1)
+            spec = HEADING_SPEC[2]
+            set_run(p.add_run(text), cn=HEI, en=EN_FONT,
+                    size=spec['size'], bold=spec['bold'])
+            enforce_heading_format(doc, 2, p)
             set_keep_with_next(p, True)
             stats['headings'] += 1
             stats['styled'] += 1
@@ -1680,16 +2220,10 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
             text = re.sub(r'\s+', ' ', p.text.strip())
             for r in list(p.runs):
                 r._r.getparent().remove(r._r)
-            set_run(p.add_run(text), cn=HEI,
-                    en=EN_FONT, size=PT_BODY, bold=True)
-            try:
-                p.style = doc.styles['Heading 3']
-            except KeyError:
-                pass
-            fmt_para(p, align=A.LEFT, line=LINE_HEADING, before=6, after=0,
-                     snap_to_grid=False)
-            _set_ind(p, left=0, firstLineChars=0, firstLine=0)
-            set_outline(p, 2)
+            spec = HEADING_SPEC[3]
+            set_run(p.add_run(text), cn=HEI, en=EN_FONT,
+                    size=spec['size'], bold=spec['bold'])
+            enforce_heading_format(doc, 3, p)
             set_keep_with_next(p, True)
             stats['headings'] += 1
             stats['styled'] += 1
@@ -1976,15 +2510,35 @@ def audit(doc) -> dict:
     if lv[1] == 0:
         issues.append('没有任何「章标题」（Heading 1）——目录会抓不到内容')
 
-    # 标题 outline level
+    # 标题的 outline level：段落层或**样式层**任一处有即可。
+    # 官方模板把 outlineLvl 放在样式上（heading 1/2/3 的 pPr 里），
+    # 所以只查段落层会误报。
     missing_outline = 0
     for p in doc.paragraphs:
         sn = p.style.name if p.style is not None else ''
-        if sn.startswith('Heading') and p._p.find(qn('w:pPr')) is not None:
-            if p._p.find(qn('w:pPr')).find(qn('w:outlineLvl')) is None:
-                missing_outline += 1
+        if not sn.startswith('Heading') or not p.text.strip():
+            continue
+        ppr = p._p.find(qn('w:pPr'))
+        in_para = ppr is not None and ppr.find(qn('w:outlineLvl')) is not None
+        in_style = False
+        try:
+            sppr = p.style.element.find(qn('w:pPr'))
+            in_style = sppr is not None and sppr.find(qn('w:outlineLvl')) is not None
+        except Exception:
+            pass
+        if not (in_para or in_style):
+            missing_outline += 1
     if missing_outline:
-        issues.append(f'{missing_outline} 个标题缺少显式 outlineLvl（建议补 0/1/2）')
+        issues.append(f'{missing_outline} 个标题缺少 outlineLvl（段落层或样式层都没有，目录会抓不到）')
+
+    # 标题的**有效字符格式**：字号/字重/字体/颜色/对齐/大纲级别是否符合规范。
+    # 这是应对「Word 样式面板被改过」与「run 上残留直接格式」的关键检查——
+    # 只看有没有套样式名是不够的。
+    head_problems = heading_format_problems(doc)
+    info['heading_format_problems'] = head_problems
+    if head_problems:
+        issues.append(f'{len(head_problems)} 处标题格式不符规范：'
+                      + '；'.join(head_problems[:3]))
 
     # 正文字体与缩进抽查——只看「真正的陈述性段落」。
     # 空白骨架里的占位小标题（如「摘　　要」下还没写内容）不应被算作正文，
@@ -2079,7 +2633,7 @@ def print_report(result: dict, title: str = 'DUT 格式报告') -> str:
             lines.append(f'  ! 提示：{w}')
         for k in ('sections', 'page', 'even_odd_headers', 'update_fields',
                   'toc_field', 'page_field', 'headings', 'tables',
-                  'nonzero_colors'):
+                  'nonzero_colors', 'heading_format_problems'):
             if k in result:
                 lines.append(f'  · {k}: {result[k]}')
     else:
