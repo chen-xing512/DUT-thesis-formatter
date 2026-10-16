@@ -83,14 +83,59 @@ execution error: “Microsoft Word”遇到一个错误：发生权限违例。 
    ```
 
 2. **`open` 返回的是 document 的 list**，直接 `set d to open …` 然后当单个文档用会报
-   `变量“d”没有定义 (-2753)`。要么取 `item 1 of`，要么用 `document 1`。
+   `变量“d”没有定义 (-2753)`。取 `item 1 of` 或 `active document` 都可以：
 
-查 Word 支持哪些命令/枚举，直接读它的 sdef：
+   ```applescript
+   tell application "Microsoft Word"
+       activate
+       open inPath
+       set theDoc to active document      -- 脚本用的写法
+       save as theDoc file name outPath file format 15
+       close theDoc saving no
+   end tell
+   ```
 
-```bash
-grep -o '<command name="[^"]*"' "/Applications/Microsoft Word.app/Contents/Resources/Word.sdef"
-awk '/<enumeration name="WdSaveFormat"/,/<\/enumeration>/' "/Applications/Microsoft Word.app/Contents/Resources/Word.sdef"
+   附带条件：目标文件若已经在 Word 里打开，`active document` 可能是**别的**文档——
+   转换前先把它关掉。
+
+   查 Word 支持哪些命令/枚举，直接读它的 sdef：
+
+   ```bash
+   grep -o '<command name="[^"]*"' "/Applications/Microsoft Word.app/Contents/Resources/Word.sdef"
+   awk '/<enumeration name="WdSaveFormat"/,/<\/enumeration>/' "/Applications/Microsoft Word.app/Contents/Resources/Word.sdef"
+   ```
+
+### ⚠ `file format` 必须写**枚举名** `format PDF`，不要写数字
+
+踩过的坑（代价很大，务必记住）：
+
+```applescript
+save as theDoc file name outPath file format 15        -- ✗ 15 = wdFormatXMLTemplateMacroEnabled
+save as theDoc file name outPath file format format PDF -- ✓ 正解
 ```
+
+`wdFormatPDF` 的数字是 **17**，不是 15。写成 15 时 Word **不报错**，脚本也看不出问题：
+生成的文件扩展名是 `.pdf`，内容却是 Word XML 模板。
+
+后果比"没有 PDF"更坏——**它能被 PDF 阅读库静默读进去**：pymupdf 会自动按自己的
+docx 渲染器把它画出来，于是你会看到一份"看起来正常"的假象，但：
+
+| 现象 | 说明 |
+|---|---|
+| 页面变成 400×600 pt（不是 A4） | 渲染器自己的默认页 |
+| 字体全变成 `Droid Sans Fallback` / `Charis SIL` | 渲染器的兜底字体，不是你设的宋体/黑体 |
+| 字号全部一样（如 11.0 pt） | 直接的 `w:sz` 被忽略 |
+| **所有分页符都失效** | 显式分页符与 `w:pageBreakBefore` 都不生效 |
+
+一旦拿这种假 PDF 去"目视核对"，会得出完全错误的结论（比如误判"分页符没生效"，
+跑去改本来正确的 XML）。
+
+**自检办法**：`file 出.pdf` 必须显示 `PDF document`。若不是（例如显示
+`Microsoft Word 2007+`），说明 `save as` 的格式参数错了。
+`scripts/convert_with_word.sh` 的第 [3/3] 步已经内建这个校验，不是 PDF 就直接报错退出。
+
+导出成功时的正常特征：`PDF document, version 1.3`、页面 `595×842 pt`（A4）、
+`producer: ... Quartz PDFContext`。
 
 ## ③ 从 PDF 出图
 

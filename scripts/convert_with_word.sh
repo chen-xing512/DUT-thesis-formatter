@@ -64,15 +64,37 @@ fi
 ok "  AppleEvent 可达 Word"
 
 # --- 3) 转换 ---------------------------------------------------------------
+# 三个坑（都实测踩过）：
+#   ① ``set theDoc to open inPath`` 在本机 Word 16 上**不返回文档对象**，
+#      于是下一句报 -2753「变量 theDoc 没有定义」；必须用
+#      ``open inPath`` 后再取 ``active document``。
+#   ② 目标文件若已在 Word 里打开，``active document`` 可能是**旧的**在内存副本：
+#      Word 按路径缓存文档，``open`` 一个已打开的文件不会重新读盘，于是你会
+#      导出上一次的旧内容，而且**毫无提示**（实测踩过：改了 docx 再导出，
+#      PDF 里的封面还是改之前的样子）。所以下面先按文件名把同名文档关掉。
+#   ③ **导出格式必须写枚举名 ``format PDF``，不要写数字常量。**
+#      曾经写成 15（以为是 wdFormatPDF），实际 15 = wdFormatXMLTemplateMacroEnabled，
+#      于是生成的文件扩展名是 .pdf、内容却是 Word XML 模板；Word 不报错、
+#      脚本不报错，只有 ``file(1)`` 才露馅。wdFormatPDF 的数字其实是 17。
+#      所以下面第 [3/3] 步会**校验产物真的是 PDF**，不是就报错退出。
 echo "[2/3] 让 Word 打开文档并另存为 PDF（Word 会短暂出现在前台）..."
+BASE="$(basename "$IN")"
+RC=0
 osascript <<OSA
 set inPath to POSIX file "$IN"
 set outPath to "$OUT"
+set fname to "$BASE"
 tell application "Microsoft Word"
 	activate
-	set theDoc to open inPath
-	-- 15 = wdFormatPDF（Word 2016 及以上的导出格式常量）
-	save as theDoc file name outPath file format 15
+	-- 同名文档若已打开，先关掉（不保存），否则会导出内存里的旧内容
+	repeat with d in documents
+		try
+			if name of d is fname then close d saving no
+		end try
+	end repeat
+	open inPath
+	set theDoc to active document
+	save as theDoc file name outPath file format format PDF
 	close theDoc saving no
 end tell
 return "saved"
@@ -80,13 +102,18 @@ OSA
 RC=$?
 
 echo "[3/3] 校验产物..."
-if [ $RC -ne 0 ]; then
-  die "Word 报错（退出码 $RC）。常见原因：输出路径无写权限、文档被占用、或上面的授权未生效。"
+if [ "${RC:-1}" -ne 0 ]; then
+  die "Word 报错（退出码 ${RC:-?}）。常见原因：输出路径无写权限、文档被占用、或上面的授权未生效。"
 fi
 if [ ! -s "$OUT" ]; then
   die "Word 未报错，但没有生成 $OUT。请确认输出目录可写。"
 fi
 if command -v file >/dev/null; then
   file "$OUT"
+  if ! file -b "$OUT" | grep -qi 'PDF'; then
+    die "导出的不是 PDF（file 显示：$(file -b "$OUT")）。
+    请检查 AppleScript 里的 save as 参数——必须写枚举名 \`format PDF\`；
+    写数字常量（如 15）会得到一个「扩展名是 .pdf 的 Word 模板」。"
+  fi
 fi
 ok "完成：$OUT  ($(wc -c < "$OUT" | tr -d ' ') 字节)"

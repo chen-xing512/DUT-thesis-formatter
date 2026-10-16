@@ -18,6 +18,7 @@ sys.path.insert(0, str(HERE.parent))
 from docx import Document  # noqa: E402
 from docx.oxml import OxmlElement  # noqa: E402
 from docx.oxml.ns import qn  # noqa: E402
+from docx.enum.style import WD_STYLE_TYPE  # noqa: E402
 from docx.enum.table import WD_TABLE_ALIGNMENT  # noqa: E402
 from docx.enum.text import WD_ALIGN_PARAGRAPH  # noqa: E402
 from docx.shared import Cm, Pt  # noqa: E402
@@ -30,7 +31,12 @@ from dut_thesis import (  # noqa: E402
     add_superscript_citation, add_toc_field, audit, classify_paragraph,
     enable_update_fields, ensure_toc_field, find_reference_blocks,
     format_reference_entry, is_latin_prose, new_doc, print_report, reformat,
-    _norm_title, CH_BODY_EN, CH_KEYWORDS,
+    _norm_title, CH_BODY_EN, CH_KEYWORDS, CH_TOC, effective_align, is_centered,
+    _front_title_key, _is_appendix_title, is_toc_paragraph, merge_keyword_lines,
+    set_page_break_before, set_keep_with_next, set_keep_lines, set_outline, set_run,
+    fmt_para, _set_ind, _PPR_SEQ, _RPR_SEQ, _order_is_bad,
+    is_field_table, _normalize_table, cover_region, normalize_cover,
+    has_drawing, CH_FIGURE, unclip_figures,
     three_line_table, CH_BODY, CH_LEVEL1, CH_LEVEL2, CH_LEVEL3, CH_REF,
     CH_CAPTION_FIG, CH_CAPTION_TAB, CH_FRONT, CH_EMPTY,
 )
@@ -589,6 +595,469 @@ def test_template_cli(tmp_root: Path):
     print(f'  ✓ CLI template 通过（{len(doc.sections)} 节）')
 
 
+def _make_toc_style(doc, name: str):
+    """在默认模板里造出 ``toc 1`` 这类目录样式（python-docx 默认模板是潜在样式）。"""
+    try:
+        st = doc.styles[name]
+    except KeyError:
+        st = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+    return st
+
+
+def _add_hyperlink_paragraph(doc, before_tab: str, page: str, style=None):
+    """造一个「文字被包在 w:hyperlink 里、以制表位+页码结尾」的目录条目段落。
+
+    这正是 Word 生成的真实目录条目（TOC 域带 ``\\h``）的结构。
+    """
+    p = doc.add_paragraph()
+    if style is not None:
+        p.style = style
+    h = OxmlElement('w:hyperlink')
+    h.set(qn('w:anchor'), '_Toc1')
+    r = OxmlElement('w:r')
+    t1 = OxmlElement('w:t')
+    t1.text = before_tab
+    t2 = OxmlElement('w:t')
+    t2.text = page
+    r.append(t1)
+    r.append(OxmlElement('w:tab'))
+    r.append(t2)
+    h.append(r)
+    p._p.append(h)
+    return p
+
+
+def test_keyword_line_is_merged():
+    """回归测试：「关键词：」题头与关键词**必须在同一行**。
+
+    真实草稿常见「题头单独占一段、关键词另起一段」的写法。早期版本只处理
+    「题头与内容同段」的情形，于是渲染出来就是题头孤零零一行——用户报的 bug。
+    """
+    doc = Document()
+    doc.add_paragraph('摘　要')
+    doc.add_paragraph('摘要正文。')
+    doc.add_paragraph('关键词：')
+    doc.add_paragraph('马克思主义方法论；中医药产业现代化；实践基础')
+    doc.add_paragraph('ABSTRACT')
+    doc.add_paragraph('English abstract.')
+    doc.add_paragraph('Key Words：')
+    doc.add_paragraph('Marxist methodology; TCM industry')
+    # 空段夹在中间也要能合并
+    doc.add_paragraph('关键词：')
+    doc.add_paragraph('')
+    doc.add_paragraph('第三个题头；测试')
+
+    n = merge_keyword_lines(doc)
+    assert n == 3, f'应合并 3 处，实际 {n}'
+    texts = [p.text for p in doc.paragraphs]
+    assert '关键词：马克思主义方法论；中医药产业现代化；实践基础' in texts, texts
+    assert 'Key Words：Marxist methodology; TCM industry' in texts, texts
+    assert '关键词：第三个题头；测试' in texts, texts
+    assert '关键词：' not in texts, '题头不应再单独成段'
+
+    # 分类：合并后是关键词行，且不再被当成正文去要求首行缩进
+    kw = [p for p in doc.paragraphs if classify_paragraph(p) == CH_KEYWORDS]
+    assert len(kw) == 3, [p.text for p in kw]
+
+    # 正文句子以「附录」开头不能被误判成附录标题（更宽松的正则会误伤）
+    assert not _is_appendix_title('附录中给出了全部实验数据，详见正文第三章。')
+    assert _is_appendix_title('附录A  实验数据表')
+    assert _is_appendix_title('附　录')
+
+    # 端到端：reformat 后题头与内容仍在一段，且审查不再报「拆成两行」
+    doc2 = Document()
+    doc2.add_paragraph('摘　要')
+    doc2.add_paragraph('摘要正文。')
+    doc2.add_paragraph('关键词：')
+    doc2.add_paragraph('遥感图像；小目标检测；特征融合')
+    doc2.add_paragraph('1 绪论')
+    doc2.add_paragraph('正文[1]。')
+    doc2.add_paragraph('参 考 文 献')
+    doc2.add_paragraph('[1] 张三. 某研究[J]. 某学报, 2020, 1(2): 3-4.')
+    doc2.add_paragraph('致　谢')
+    doc2.add_paragraph('感谢导师。')
+    stats = reformat(doc2, strict_refs=False)
+    assert stats['keywords_merged'] == 1, stats
+    kws = [p for p in doc2.paragraphs if classify_paragraph(p) == CH_KEYWORDS]
+    assert len(kws) == 1 and '遥感图像' in kws[0].text
+    info = audit(doc2)
+    bad = [i for i in info['issues'] if '两行' in i]
+    assert not bad, info['issues']
+    (r_head, r_body) = kws[0].runs[0], kws[0].runs[-1]
+    assert r_head._element.find(qn('w:rPr')).find(qn('w:rFonts')).get(qn('w:eastAsia')) == '黑体'
+    assert r_body._element.find(qn('w:rPr')).find(qn('w:rFonts')).get(qn('w:eastAsia')) == '宋体'
+    print('  ✓ 关键词题头与内容合并成一行（含空段/中英双份）通过')
+
+
+def test_front_titles_are_centered():
+    """回归测试：参考文献 / 致谢标题**必须居中**。
+
+    真实输入里这些标题常常已经套了 ``Heading 1``（于是左对齐）、
+    写成 ``参考文献（References）`` 这类变体、或被加了自动编号（左边多一个黑方块）。
+    只按「去空格后精确匹配 + 分类」处理会漏判，用户报的 bug 就是标题没居中。
+    """
+    doc = Document()
+    doc.add_paragraph('摘　要')
+    doc.add_paragraph('摘要正文。')
+    doc.add_paragraph('关键词：测试；居中')
+    doc.add_paragraph('1 绪论')
+    doc.add_paragraph('正文[1]。')
+    # 参考文献标题：套了 Heading 1 + 带自动编号
+    ref_title = doc.add_paragraph(style='Heading 1')
+    ref_title.add_run('参 考 文 献')
+    numpr = OxmlElement('w:numPr')
+    ilvl = OxmlElement('w:ilvl'); ilvl.set(qn('w:val'), '0')
+    numid = OxmlElement('w:numId'); numid.set(qn('w:val'), '1')
+    numpr.append(ilvl); numpr.append(numid)
+    ref_title._p.get_or_add_pPr().append(numpr)
+    doc.add_paragraph('[1] 张三. 某研究[J]. 某学报, 2020, 1(2): 3-4.')
+    # 致谢标题：英文别名变体 + 带主题蓝的直接格式
+    ack = doc.add_paragraph(style='Heading 1')
+    r = ack.add_run('Acknowledgements')
+    _rpr = r._element.get_or_add_rPr()
+    color = OxmlElement('w:color'); color.set(qn('w:val'), '365F91')
+    _rpr.append(color)
+    doc.add_paragraph('感谢导师。')
+
+    assert _front_title_key('参 考 文 献') == '参考文献'
+    assert _front_title_key('参考文献（References）') == '参考文献'
+    assert _front_title_key('References') == 'REFERENCES'
+    assert _front_title_key(' Acknowledgements ') == 'ACKNOWLEDGEMENTS'
+    assert _front_title_key('谢辞') == 'ACKNOWLEDGEMENTS'
+    assert _front_title_key('1 引言') is None
+
+    stats = reformat(doc, strict_refs=False)
+    assert stats['front_titles_fixed'] >= 3, stats
+    found = {}
+    for p in doc.paragraphs:
+        k = _front_title_key(p.text)
+        if k:
+            found[k] = p
+    assert '参考文献' in found and 'ACKNOWLEDGEMENTS' in found, list(found)
+    for k, p in found.items():
+        assert is_centered(p), f'{k} 标题没有居中（align={effective_align(p)}）'
+        ppr = p._p.find(qn('w:pPr'))
+        assert ppr.find(qn('w:numPr')) is None, f'{k} 标题上仍残留自动编号'
+    # 「Acknowledgements」是英文标题：Times New Roman 小三
+    size, bold, ea, color = _effective_char_fmt(found['ACKNOWLEDGEMENTS'])
+    assert ea == 'Times New Roman' and abs(size - PT_ABSTRACT) < 0.1, (ea, size)
+    size, bold, ea, color = _effective_char_fmt(found['参考文献'])
+    assert ea == '黑体' and abs(size - PT_ABSTRACT) < 0.1, (ea, size)
+    assert (color or '000000').upper() in ('000000', ''), '标题颜色应被钉成黑色'
+
+    info = audit(doc)
+    bad = [i for i in info['issues'] if '前置标题' in i or '标题样式' in i]
+    assert not bad, info['issues']
+    print('  ✓ 参考文献/致谢（含 Heading 样式、编号、英文别名）标题居中 通过')
+
+
+def test_reference_url_and_justify():
+    """回归测试：参考文献的网址不能被「补空格」规则拆断，也不能两端对齐。
+
+    早期 ``format_reference_entry`` 对每个句点都补空格，把
+    ``https://www.gov.cn/...`` 写成 ``https://www. gov. cn/...``（网址作废）；
+    另外两端对齐会把 URL 之前那一行拉成「国 办 发 （ 2023 ） 3 号」。
+    """
+    raw = ('国务院办公厅. 国务院办公厅关于印发中医药振兴发展重大工程实施方案的通知: '
+           '国办发〔2023〕3号[A/OL]. (2023-02-10)[2026-10-15]. '
+           'https://www.gov.cn/zhengce/zhengceku/2023-02/28/content_5743680.htm.')
+    out = format_reference_entry(raw, 2)
+    assert 'https://www.gov.cn/zhengce/zhengceku/2023-02/28/content_5743680.htm' in out, out
+    assert '. ' not in out.split('https://')[1], out
+    # 邮箱与带点数字同样不能被拆
+    out2 = format_reference_entry('张三. 报告[R]. 北京: 某社, 2020. E-mail: a.b@x.com.cn.', 3)
+    assert 'a.b@x.com.cn' in out2, out2
+    out3 = format_reference_entry('李四. 标准[S]. DOI: 10.1234/abc.def, 2021.', 4)
+    assert '10.1234/abc.def' in out3, out3
+
+    doc = Document()
+    doc.add_paragraph('摘　要')
+    doc.add_paragraph('摘要正文。')
+    doc.add_paragraph('关键词：测试；参考文献')
+    doc.add_paragraph('1 绪论')
+    doc.add_paragraph('正文[1]。')
+    doc.add_paragraph('参 考 文 献')
+    doc.add_paragraph('[1] 国务院办公厅. 通知[A/OL]. (2023-02-10)[2026-10-15]. '
+                      'https://www.gov.cn/zhengce/zhengceku/2023-02/28/content_5743680.htm.')
+    stats = reformat(doc)
+    assert stats['references'].get('kept') == 1, stats['references']
+    refs = [p for p in doc.paragraphs if classify_paragraph(p) == CH_REF]
+    assert refs, '没有参考文献条目'
+    for p in refs:
+        assert 'https://www.gov.cn/zhengce/zhengceku/2023-02/28/content_5743680.htm' in p.text, p.text
+        assert effective_align(p) == 'left', f'参考文献应左对齐，实际 {effective_align(p)}'
+        ind = p._p.find(qn('w:pPr')).find(qn('w:ind'))
+        assert ind.get(qn('w:left')) == '170' and ind.get(qn('w:hanging')) == '170', ind.attrib
+    info = audit(doc)
+    bad = [i for i in info['issues'] if '网址' in i or '两端对齐' in i]
+    assert not bad, info['issues']
+    print('  ✓ 参考文献网址保真 + 左对齐 + 悬挂缩进 170 通过')
+
+
+def test_toc_entries_untouched():
+    """回归测试：目录条目**一个字都不能改**。
+
+    目录条目的文字来自 TOC 域、且包在 ``w:hyperlink`` 里。早期版本用
+    ``p.runs`` 清文字（漏掉超链接里的 run）再 ``add_run(p.text)``，于是
+    「1 引言」变成「1 引言 11 引言 1」，条目还被套成了 ``Heading 1``——
+    目录直接被写坏。这个 bug 只有在含真实目录域的文档上才出现。
+    """
+    doc = Document()
+    toc_style = _make_toc_style(doc, 'toc 1')
+    toc_style2 = _make_toc_style(doc, 'toc 2')
+    doc.add_paragraph('目　　录')
+    _add_hyperlink_paragraph(doc, '1 引言', '1', style=toc_style)
+    _add_hyperlink_paragraph(doc, '1.1 研究背景', '1', style=toc_style2)
+    doc.add_paragraph('1 引言')
+    doc.add_paragraph('正文[1]。')
+    doc.add_paragraph('参 考 文 献')
+    doc.add_paragraph('[1] 张三. 某研究[J]. 某学报, 2020.')
+
+    toc_paras = [p for p in doc.paragraphs if is_toc_paragraph(p)]
+    assert len(toc_paras) == 2, [p.text for p in toc_paras]
+    assert classify_paragraph(toc_paras[0]) == CH_TOC
+    before = [p.text for p in toc_paras]
+
+    stats = reformat(doc, strict_refs=False)
+    assert stats.get('toc_skipped') == 2, stats
+
+    after = [p for p in doc.paragraphs if is_toc_paragraph(p)]
+    assert [p.text for p in after] == before, [p.text for p in after]
+    for p in after:
+        assert p.style.name.startswith('toc'), p.style.name
+        assert not p.style.name.startswith('Heading'), '目录条目被套成了标题样式'
+
+    info = audit(doc)
+    bad = [i for i in info['issues'] if '目录条目' in i]
+    assert not bad, info['issues']
+    print('  ✓ 目录条目（超链接 + toc 样式）原样保留、不翻倍、不变标题 通过')
+
+
+def test_reference_renumbering_matches_citations():
+    """回归测试：参考文献按引用顺序重排后，**正文里的 [n] 必须一起重编号**。
+
+    真实论文章节里 [16] 可能比 [6] 先被引用，重排后第 6 位就换成了另一篇文献。
+    早期实现只改条目顺序、不动正文标注，于是正文的 [6] 指到了别的文献上——
+    这是送审必被打回的硬伤，而且肉眼极难发现。
+    """
+    doc = Document()
+    doc.add_paragraph('摘　要')
+    doc.add_paragraph('摘要正文。')
+    doc.add_paragraph('关键词：引用；重编号')
+    doc.add_paragraph('1 绪论')
+    # 引用顺序：1, 2, 3（先引 [3] 再引 [2]）→ 重排后 [3] 应变成 [2]
+    doc.add_paragraph('正文引用了[1]。')
+    doc.add_paragraph('又一说法[3]。')
+    doc.add_paragraph('再看[2-3]。')
+    doc.add_paragraph('参 考 文 献')
+    doc.add_paragraph('[1] 甲. 文献一[J]. 某刊, 2020.')
+    doc.add_paragraph('[2] 乙. 文献二[J]. 某刊, 2021.')
+    doc.add_paragraph('[3] 丙. 文献三[J]. 某刊, 2022.')
+    doc.add_paragraph('[4] 丁. 没人引用[J]. 某刊, 2023.')
+
+    stats = reformat(doc, strict_refs=True)
+    refs = stats['references']
+    assert refs['kept'] == 3, refs
+    assert any('没人引用' in r for r in refs['removed']), refs['removed']
+
+    entries = [p.text for p in doc.paragraphs if classify_paragraph(p) == CH_REF]
+    assert entries[1].startswith('[2] 丙.'), entries       # 丙 是第二个被引用的
+    assert entries[2].startswith('[3] 乙.'), entries
+    body = '\n'.join(p.text for p in doc.paragraphs
+                     if classify_paragraph(p) not in (CH_REF,))
+    assert '又一说法[2]。' in body, body          # 旧 [3] → 新 [2]
+    assert '再看[2-3]。' in body, body            # 旧 [2-3] → 新 [2-3]（都还在）
+    assert '[4]' not in body.split('参 考 文 献')[0], body
+
+    info = audit(doc)
+    bad = [i for i in info['issues'] if '不存在的编号' in i]
+    assert not bad, info['issues']
+    assert info.get('citations_checked') == [1, 2, 3], info.get('citations_checked')
+    print('  ✓ 参考文献重排后正文标注同步重编号 通过')
+
+
+def test_element_order_in_ppr_and_rpr():
+    """回归测试：``w:pPr`` / ``w:rPr`` 的子元素必须按 OOXML schema 顺序排列。
+
+    顺序错了 Word **不报错、不修复，直接默默忽略**那个属性。实测踩过：
+    ``<w:pageBreakBefore/>`` 被排在 ``<w:outlineLvl/>`` 之后时，
+    「参考文献 / 致谢另起一页」在 Word 里完全不生效——读 XML 明明有
+    pageBreakBefore，只有把文档渲染成 PDF 才发现标题和正文挤在同一页。
+    同理 ``w:b`` 排在 ``w:sz`` 之后，加粗也可能不生效。
+    """
+    doc = new_doc()
+    p = add_plain_heading(doc, '参 考 文 献')
+    set_page_break_before(p, True)
+    set_keep_with_next(p, True)
+    set_keep_lines(p, True)
+    set_outline(p, 0)
+    fmt_para(p, align=WD_ALIGN_PARAGRAPH.CENTER, line=1.5, before=0, after=12,
+             snap_to_grid=False)
+    _set_ind(p, left=0, firstLineChars=0, firstLine=0)
+
+    ppr = p._p.find(qn('w:pPr'))
+    assert not _order_is_bad(ppr, _PPR_SEQ), \
+        [el.tag.rsplit('}', 1)[-1] for el in ppr]
+    tags = [el.tag.rsplit('}', 1)[-1] for el in ppr]
+    assert tags.index('pageBreakBefore') < tags.index('outlineLvl'), tags
+    assert tags.index('keepNext') < tags.index('spacing'), tags
+    assert tags.index('snapToGrid') < tags.index('spacing'), tags
+    assert tags.index('ind') < tags.index('outlineLvl'), tags
+
+    run = set_run(p.add_run('x'), cn='黑体', size=PT_ABSTRACT, bold=False)
+    rpr = run._element.find(qn('w:rPr'))
+    assert not _order_is_bad(rpr, _RPR_SEQ), \
+        [el.tag.rsplit('}', 1)[-1] for el in rpr]
+    rtags = [el.tag.rsplit('}', 1)[-1] for el in rpr]
+    assert rtags.index('rFonts') < rtags.index('b') < rtags.index('sz'), rtags
+
+    # audit 必须能查出顺序错误（防止以后再退化）
+    info = audit(doc)
+    assert info['element_order_bad'] == {'pPr': 0, 'rPr': 0}, info['element_order_bad']
+    print('  ✓ w:pPr / w:rPr 子元素顺序符合 OOXML schema 通过')
+
+
+def test_cover_is_not_mangled():
+    """回归测试：封面（封一）**绝不能**被当成正文或三线表处理。
+
+    用户报的问题就是这两条：
+
+    1. 封面标题被套成「小四宋体 + 首行缩进 2 字符 + 两端对齐」，
+       原本的「华文细黑 24/22/16 pt 居中」全没了；
+    2. 封面字段块（``标签 | ： | 值``）被当普通表格转成三线表，
+       值单元格的下边框（= 填写横线）被抹掉，还多出上下两条 1.5 磅粗黑线。
+    """
+    doc = new_doc()
+    add_cover(doc, title_cn='以实践为基础的研究', title_en='A Practice-Based Study',
+              fields=[('作者姓名', '张三'), ('学号', '32538107')])
+    add_section(doc, kind='front', title_cn='以实践为基础的研究')
+    add_plain_heading(doc, '摘　　要')
+    doc.add_paragraph('摘要正文。')
+    add_section(doc, kind='body', title_cn='以实践为基础的研究')
+    add_heading(doc, '1 绪论', 1)
+    doc.add_paragraph('正文[1]。')
+    t = doc.add_table(rows=2, cols=2)
+    t.style = 'Table Grid'
+    t.rows[0].cells[0].text = '项目'
+    t.rows[1].cells[0].text = '温度'
+    doc.add_paragraph('参 考 文 献')
+    doc.add_paragraph('[1] 张三. 某研究[J]. 某学报, 2020.')
+
+    field_tbl = doc.tables[0]
+    data_tbl = doc.tables[1]
+    assert is_field_table(field_tbl), '封面字段表没被认出来'
+    assert not is_field_table(data_tbl), '数据表被误判成封面字段表'
+
+    # 先把字段表「弄坏」成三线表，模拟旧版本干过的事
+    _normalize_table(field_tbl)
+    broken = field_tbl.rows[0].cells[0]._tc.find(qn('w:tcPr')).find(qn('w:tcBorders'))
+    assert broken.find(qn('w:top')).get(qn('w:sz')) == '12', '前置条件：字段表已被转成三线表'
+
+    stats = reformat(doc, title_cn='以实践为基础的研究')
+    assert stats['cover_skipped'] >= 3, stats
+    assert stats['cover']['field_tables'] == 1, stats['cover']
+
+    # ① 封面标题行：华文细黑 24 / 22 / 16 pt，居中，无首行缩进
+    cover = [p for p in doc.paragraphs if (p.text or '').strip()][:3]
+    want = [(24.0, '华文细黑'), (22.0, '华文细黑'), (16.0, 'Times New Roman')]
+    for p, (size, ea) in zip(cover, want):
+        assert is_centered(p), f'封面行未居中：{p.text!r} align={effective_align(p)}'
+        ind = p._p.find(qn('w:pPr')).find(qn('w:ind'))
+        assert ind.get(qn('w:firstLineChars')) == '0', f'封面行被加了首行缩进：{p.text!r}'
+        got_size, bold, got_ea, color = _effective_char_fmt(p)
+        assert abs(got_size - size) < 0.1, f'{p.text!r} 字号 {got_size}，应为 {size}'
+        assert got_ea == ea, f'{p.text!r} 中文字体 {got_ea}，应为 {ea}'
+        assert bold, f'{p.text!r} 应加粗'
+
+    # ② 字段表：只留值单元格下边框（0.5 磅），没有三线表的粗线
+    assert is_field_table(doc.tables[0])
+    for ri, row in enumerate(doc.tables[0].rows):
+        for ci, cell in enumerate(row.cells):
+            b = cell._tc.find(qn('w:tcPr')).find(qn('w:tcBorders'))
+            bottom = b.find(qn('w:bottom')).get(qn('w:sz'))
+            top = b.find(qn('w:top')).get(qn('w:sz'))
+            if ci == 2:
+                assert bottom == '4', f'填写线应为 0.5 磅，实际 {bottom}'
+            else:
+                assert bottom == '0', f'第 {ri} 行第 {ci} 列不应画线'
+            assert top == '0', f'字段表不该有上线（第 {ri} 行）'
+    tb = doc.tables[0]._tbl.tblPr.find(qn('w:tblBorders'))
+    assert tb.find(qn('w:top')).get(qn('w:val')) == 'none'
+
+    # ③ 正文里的普通表格照样要变成三线表
+    tb2 = doc.tables[1]._tbl.tblPr.find(qn('w:tblBorders'))
+    assert tb2.find(qn('w:left')).get(qn('w:val')) == 'none'
+    hdr = doc.tables[1].rows[0].cells[0]._tc.find(qn('w:tcPr')).find(qn('w:tcBorders'))
+    assert hdr.find(qn('w:top')).get(qn('w:sz')) == '12', '数据表应成为三线表（上线 1.5 磅）'
+    print('  ✓ 封面标题（24/22/16pt 居中）+ 字段表填写线 不被正文/三线表规则破坏 通过')
+
+
+def test_figure_paragraph_never_fixed_line_height():
+    """回归测试：含图的段落**不能**用固定行距，否则嵌入型图片会被裁掉一半。
+
+    Word 的行框高度被 ``w:lineRule="exact"`` 钉死后，行内图片只显示落在行框里的
+    那一条——看起来就是「图片被隐藏了一半」；选中图片按 Ctrl+1（单倍行距）
+    即可恢复。旧代码把「只有图、没有文字」的段落当空行，设成固定行距 25 磅，
+    于是插图全被裁掉（用户报的 bug）。
+    """
+    doc = new_doc()
+    add_plain_heading(doc, '摘　　要')
+    doc.add_paragraph('摘要正文。')
+    add_heading(doc, '1 绪论', 1)
+    doc.add_paragraph('正文[1]。')
+
+    # 造一个「只有图」的段落：空文字 + w:drawing
+    pic = doc.add_paragraph()
+    pic.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    pic.add_run()._r.append(OxmlElement('w:drawing'))
+    # 再造一个「图与文字同段」的
+    mixed = doc.add_paragraph('见图示：')
+    mixed.add_run()._r.append(OxmlElement('w:pict'))
+
+    doc.add_paragraph('图 1.1 系统结构')
+    doc.add_paragraph('参 考 文 献')
+    doc.add_paragraph('[1] 张三. 某研究[J]. 某学报, 2020.')
+
+    assert has_drawing(pic) and has_drawing(mixed)
+    assert classify_paragraph(pic) == CH_FIGURE, classify_paragraph(pic)
+    assert classify_paragraph(pic) != CH_EMPTY, '含图段不能当成空行'
+
+    # 先把含图段设成固定行距（模拟旧版本干过的事）
+    for q in (pic, mixed):
+        fmt_para(q, line=1.0, exact=25, before=0, after=0, snap_to_grid=False)
+    sp = pic._p.find(qn('w:pPr')).find(qn('w:spacing'))
+    assert sp.get(qn('w:lineRule')) == 'exact', '前置条件：已设固定行距'
+
+    stats = reformat(doc, strict_refs=False)
+    assert stats.get('figures', 0) >= 1, stats
+
+    for q in (pic, mixed):
+        sp = q._p.find(qn('w:pPr')).find(qn('w:spacing'))
+        assert sp is None or sp.get(qn('w:lineRule')) != 'exact', \
+            f'含图段仍是固定行距：{sp.attrib if sp is not None else None}'
+    ind = pic._p.find(qn('w:pPr')).find(qn('w:ind'))
+    assert ind.get(qn('w:firstLineChars')) == '0'
+    assert is_centered(pic)
+
+    # 兜底函数本身：「图与文字同段」又被设了固定行距时也要能解除
+    d2 = Document()
+    m = d2.add_paragraph('图示：')
+    m.add_run()._r.append(OxmlElement('w:drawing'))
+    fmt_para(m, line=1.0, exact=25, before=0, after=0, snap_to_grid=False)
+    assert unclip_figures(d2) == 1, '兜底未解除固定行距'
+    sp = m._p.find(qn('w:pPr')).find(qn('w:spacing'))
+    assert sp.get(qn('w:lineRule')) == 'auto' and sp.get(qn('w:line')) == '240', sp.attrib
+
+    # audit 必须能查出固定行距的插图段（防止再退化）
+    assert audit(doc)['figures_checked'] >= 2, audit(doc)['figures_checked']
+    bad = Document()
+    bp = bad.add_paragraph()
+    bp.add_run()._r.append(OxmlElement('w:drawing'))
+    fmt_para(bp, line=1.0, exact=25, before=0, after=0, snap_to_grid=False)
+    assert any('固定行距' in i for i in audit(bad)['issues']), audit(bad)['issues']
+    print('  ✓ 含图段落不用固定行距（图片不被裁半）+ audit 可查 通过')
+
+
 def main() -> int:
     print('== dut-thesis-formatter 冒烟测试 ==')
     test_classify()
@@ -602,6 +1071,14 @@ def main() -> int:
     test_footer_and_header_cover_all_variants()
     test_english_and_keywords_and_color()
     test_field_table_alignment()
+    test_keyword_line_is_merged()
+    test_front_titles_are_centered()
+    test_reference_url_and_justify()
+    test_toc_entries_untouched()
+    test_reference_renumbering_matches_citations()
+    test_element_order_in_ppr_and_rpr()
+    test_cover_is_not_mangled()
+    test_figure_paragraph_never_fixed_line_height()
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         test_end_to_end_reformat(root)

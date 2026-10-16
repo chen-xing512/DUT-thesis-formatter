@@ -53,6 +53,7 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 from docx.table import Table
 from docx.text.paragraph import Paragraph
+from docx.text.run import Run
 
 __all__ = [
     # 常量
@@ -112,6 +113,11 @@ PT_PAGENUM = FONT_SIZE['小五']   # 9   页码
 
 LINE_BODY = 1.25        # 正文多倍行距
 LINE_HEADING = 1.5      # 标题行距
+
+#: 参考文献条目的对齐方式。规范正文只说「两端对齐」，但条目里常带超长 URL，
+#: 两端对齐会把 URL 之前那一行拉成「国 办 发 （ 2023 ） 3 号」这种字距炸开的样子
+#: （用户实际反馈的 bug）。左对齐不会拉伸，也不影响悬挂缩进。
+REF_ALIGN = WD_ALIGN_PARAGRAPH.LEFT
 
 #: 三级标题的**权威规格**——样式层、段落层、校验层都从这里取，避免三处各写一份而对不上。
 #:
@@ -186,6 +192,7 @@ def set_run(run, cn: str = SONG, en: str = EN_FONT, size: float = PT_BODY,
     rf.set(qn('w:hAnsi'), en)
     rf.set(qn('w:eastAsia'), cn)
     rf.set(qn('w:cs'), en)
+    _fix_order(rpr, _RPR_SEQ)
     return run
 
 
@@ -223,20 +230,79 @@ def fmt_para(p, align=None, line: float = LINE_BODY, before: float = 0,
     return p
 
 
+#: ``w:pPr`` 子元素的**法定顺序**（OOXML ``CT_PPr`` 的 schema 序列）。
+#:
+#: 这是 schema 硬要求，python-docx 自己新增元素时也是按这个顺序插入的
+#: （见 ``CT_PPr._tag_seq``）。手工 ``ppr.append(...)`` 会写出不合规的顺序，
+#: 而 Word / LibreOffice / 各种 docx 库对不合规顺序的容忍度不一致，
+#: 轻则忽略该属性，重则提示「文档已损坏，是否修复」。
+#: 所以每次改完 ``w:pPr`` / ``w:rPr`` 都要调 :func:`_fix_order` 归一化顺序。
+_PPR_SEQ = (
+    'w:pStyle', 'w:keepNext', 'w:keepLines', 'w:pageBreakBefore', 'w:framePr',
+    'w:widowControl', 'w:numPr', 'w:suppressLineNumbers', 'w:pBdr', 'w:shd',
+    'w:tabs', 'w:suppressAutoHyphens', 'w:kinsoku', 'w:wordWrap',
+    'w:overflowPunct', 'w:topLinePunct', 'w:autoSpaceDE', 'w:autoSpaceDN',
+    'w:bidi', 'w:adjustRightInd', 'w:snapToGrid', 'w:spacing', 'w:ind',
+    'w:contextualSpacing', 'w:mirrorIndents', 'w:suppressOverlap', 'w:jc',
+    'w:textDirection', 'w:textAlignment', 'w:textboxTightWrap', 'w:outlineLvl',
+    'w:divId', 'w:cnfStyle', 'w:rPr', 'w:sectPr', 'w:pPrChange',
+)
+
+#: ``w:rPr`` 子元素的法定顺序（``CT_RPr``）。理由同 :data:`_PPR_SEQ`：
+#: 例如 ``w:b`` 必须排在 ``w:sz`` 之前。
+_RPR_SEQ = (
+    'w:rStyle', 'w:rFonts', 'w:b', 'w:bCs', 'w:i', 'w:iCs', 'w:caps',
+    'w:smallCaps', 'w:strike', 'w:dstrike', 'w:outline', 'w:shadow',
+    'w:emboss', 'w:imprint', 'w:noProof', 'w:snapToGrid', 'w:vanish',
+    'w:webHidden', 'w:color', 'w:spacing', 'w:w', 'w:kern', 'w:position',
+    'w:sz', 'w:szCs', 'w:highlight', 'w:u', 'w:effect', 'w:bdr', 'w:shd',
+    'w:fitText', 'w:vertAlign', 'w:rtl', 'w:cs', 'w:em', 'w:lang',
+    'w:eastAsianLayout', 'w:specVanish', 'w:oMath',
+)
+
+
+def _seq_rank(seq):
+    def _rank(el):
+        name = el.tag.rsplit('}', 1)[-1]
+        key = 'w:' + name
+        try:
+            return seq.index(key)
+        except ValueError:
+            return len(seq)          # 未知扩展元素排到最后
+    return _rank
+
+
+def _order_is_bad(parent, seq) -> bool:
+    """``parent`` 的子元素顺序是否符合 ``seq``（不符合时 Word 会忽略这些属性）。"""
+    children = list(parent)
+    if len(children) < 2:
+        return False
+    return sorted(children, key=_seq_rank(seq)) != children
+
+
+def _fix_order(parent, seq) -> bool:
+    """把 ``parent`` 的子元素按 ``seq`` 重排（稳定排序），返回是否改动过。"""
+    children = list(parent)
+    if not _order_is_bad(parent, seq):
+        return False
+    ordered = sorted(children, key=_seq_rank(seq))
+    for el in children:
+        parent.remove(el)
+    for el in ordered:
+        parent.append(el)
+    return True
+
+
 def _set_ind(p, **attrs):
     """写 ``w:ind``。属性名用 OOXML 原名（firstLineChars / hanging / left …），值为字符串。"""
     ppr = p._p.get_or_add_pPr()
     ind = ppr.find(qn('w:ind'))
     if ind is None:
         ind = OxmlElement('w:ind')
-        # w:ind 必须排在 pPr 的合法位置：插到 numPr/jc 之后、rPr 之前
-        rpr = ppr.find(qn('w:rPr'))
-        if rpr is not None:
-            rpr.addprevious(ind)
-        else:
-            ppr.append(ind)
+        ppr.append(ind)
     for k, v in attrs.items():
         ind.set(qn('w:' + k), str(v))
+    _fix_order(ppr, _PPR_SEQ)
     return ind
 
 
@@ -246,14 +312,91 @@ def first_line_chars(p, chars: int = 2):
     return p
 
 
+def para_runs(p) -> list:
+    """段落里**所有** run，含 ``w:hyperlink`` 里的。
+
+    为什么不能用 ``p.runs``：python-docx 的 ``p.runs`` 只返回 ``w:p`` 的直接
+    子 ``w:r``，而 ``p.text`` **会**把 ``w:hyperlink/w:r/w:t`` 里的文字也算进去。
+    两者不一致就会出事：
+
+    * 目录条目（TOC 域带 ``\\h``）和正文里的超链接，文字都在 ``w:hyperlink`` 内；
+    * 「先删光 ``p.runs`` 再 ``add_run(p.text)``」的写法删不掉超链接里的文字，
+      于是那段文字被**写了两遍**——目录条目一旦被误判成标题，就会出现
+      「1 引言 11 引言 1」这种翻倍文字（真实发生过的 bug）；
+    * 只格式化 ``p.runs`` 时，超链接里的字体会保持原样，和周围正文不一致。
+    """
+    runs = list(p.runs)
+    for h in p._p.findall(qn('w:hyperlink')):
+        for r in h.findall(qn('w:r')):
+            runs.append(Run(r, p))
+    return runs
+
+
+def replace_text(p, text: str):
+    """把段落文字**整段**换成 ``text``，返回新建的 run。
+
+    会连同 ``w:hyperlink`` 一起清掉（超链接的文字由新 run 重新写出，
+    只是不再可点）——比留下重复文字安全得多。
+    """
+    for h in list(p._p.findall(qn('w:hyperlink'))):
+        p._p.remove(h)
+    for r in list(p.runs):
+        r._r.getparent().remove(r._r)
+    return p.add_run(text)
+
+
+def clear_numbering(p):
+    """去掉段落的自动编号/项目符号（``w:numPr``）。
+
+    标题若带列表编号，Word 会在标题左边渲染出一个黑方块（▪），
+    而且会和「居中」打架——居中标题前多一个方块是明显的排版事故。
+    """
+    ppr = p._p.get_or_add_pPr()
+    n = 0
+    for el in ppr.findall(qn('w:numPr')):
+        ppr.remove(el)
+        n += 1
+    if n:
+        _fix_order(ppr, _PPR_SEQ)
+    return n
+
+
+def effective_align(p):
+    """段落**有效**对齐方式：段落层直接格式 > 样式 > basedOn 链；没有返回 None。"""
+    ppr = p._p.find(qn('w:pPr'))
+    if ppr is not None:
+        jc = ppr.find(qn('w:jc'))
+        if jc is not None:
+            return jc.get(qn('w:val'))
+    st = p.style
+    hops = 0
+    while st is not None and hops < 10:
+        sppr = st.element.find(qn('w:pPr'))
+        if sppr is not None:
+            jc = sppr.find(qn('w:jc'))
+            if jc is not None:
+                return jc.get(qn('w:val'))
+        try:
+            st = st.base_style
+        except Exception:
+            st = None
+        hops += 1
+    return None
+
+
+def is_centered(p) -> bool:
+    return (effective_align(p) or '').lower() in ('center', 'centre')
+
+
 def set_snap_to_grid(p, on: bool = False):
     """取消/启用「对齐到网格」。正文必须关闭（``w:snapToGrid val="0"``），否则行距会被网格拉偏。"""
     ppr = p._p.get_or_add_pPr()
     el = ppr.find(qn('w:snapToGrid'))
     if el is None:
         el = OxmlElement('w:snapToGrid')
-        ppr.insert(0, el)
+        ppr.append(el)
     el.set(qn('w:val'), '1' if on else '0')
+    _fix_order(ppr, _PPR_SEQ)
     return p
 
 
@@ -265,6 +408,7 @@ def set_outline(p, level: int):
     ol = OxmlElement('w:outlineLvl')
     ol.set(qn('w:val'), str(level))
     ppr.append(ol)
+    _fix_order(ppr, _PPR_SEQ)
     return p
 
 
@@ -276,6 +420,7 @@ def set_keep_with_next(p, on: bool = True):
         ppr.remove(old)
     if on:
         ppr.append(OxmlElement(tag))
+    _fix_order(ppr, _PPR_SEQ)
     return p
 
 
@@ -287,6 +432,7 @@ def set_keep_lines(p, on: bool = True):
         ppr.remove(old)
     if on:
         ppr.append(OxmlElement(tag))
+    _fix_order(ppr, _PPR_SEQ)
     return p
 
 
@@ -298,6 +444,7 @@ def set_page_break_before(p, on: bool = True):
     if on:
         el = OxmlElement('w:pageBreakBefore')
         ppr.append(el)
+    _fix_order(ppr, _PPR_SEQ)
     return p
 
 
@@ -790,6 +937,7 @@ def strip_style_color(style, rgb=(0, 0, 0)):
     el = OxmlElement('w:color')
     el.set(qn('w:val'), '%02X%02X%02X' % rgb)
     rpr.append(el)
+    _fix_order(rpr, _RPR_SEQ)
     return style
 
 
@@ -813,180 +961,10 @@ _OVERRIDE_RPR_TAGS = (
 _OVERRIDE_ALLOWED = ('w:rFonts',)
 
 
-def strip_char_overrides(para, keep_bold: bool | None = None):
-    """剥掉段落内所有 run 的**字符级直接格式**，让样式成为唯一来源。
-
-    命名样式只是「继承基线」：run 上任何直接格式都优先于样式。用户从别处
-    粘一段标题进来、或手动加粗/改字号，样式就形同虚设。所以套样式之后
-    必须把这些覆盖清掉，渲染才真正听规范的。
-
-    :param keep_bold: ``None`` 时保留现有粗体设置（只清字号字体等）；
-        给 ``True``/``False`` 则连 ``w:b`` 一起定型。
-    """
-    for r in para.runs:
-        rpr = r._element.find(qn('w:rPr'))
-        if rpr is None:
-            continue
-        for tag in _OVERRIDE_RPR_TAGS:
-            if tag in ('w:b', 'w:bCs') and keep_bold is not None:
-                continue
-            for el in rpr.findall(qn(tag)):
-                rpr.remove(el)
-        if keep_bold is not None:
-            for tag in ('w:b', 'w:bCs'):
-                for el in rpr.findall(qn(tag)):
-                    rpr.remove(el)
-                if keep_bold:
-                    rpr.append(OxmlElement(tag))
-    return para
-
-
-def _effective_char_fmt(para):
-    """返回段落首个 run 的**有效**字符格式 ``(size_pt, bold, eastAsia, color)``。
-
-    先看 run 的直接格式，没有则回落到它的段落样式，再看样式的 basedOn 链。
-    """
-    def _from_rpr(rpr):
-        if rpr is None:
-            return {}
-        out = {}
-        sz = rpr.find(qn('w:sz'))
-        if sz is not None:
-            try:
-                out['size'] = int(sz.get(qn('w:val'))) / 2.0
-            except (TypeError, ValueError):
-                pass
-        _b = rpr.find(qn('w:b'))
-        if _b is not None:
-            _v = (_b.get(qn('w:val')) or '1').lower()
-            out['bold'] = _v not in ('0', 'false', 'off')
-        # 没有 w:b 时不写 bold，留给继承链决定
-        rf = rpr.find(qn('w:rFonts'))
-        if rf is not None and rf.get(qn('w:eastAsia')):
-            out['eastAsia'] = rf.get(qn('w:eastAsia'))
-        c = rpr.find(qn('w:color'))
-        if c is not None:
-            out['color'] = (c.get(qn('w:val')) or '').upper()
-        return out
-
-    run = para.runs[0] if para.runs else None
-    direct = _from_rpr(run._element.find(qn('w:rPr'))) if run is not None else {}
-
-    st = para.style
-    chain = []
-    while st is not None:
-        chain.append(st)
-        try:
-            st = st.base_style
-        except Exception:
-            st = None
-        if len(chain) > 10:
-            break
-    merged = {}
-    for style in reversed(chain):          # 从最根上的 Normal 往下盖
-        merged.update(_from_rpr(style.element.find(qn('w:rPr'))))
-    merged.update(direct)                  # 直接格式优先级最高
-    return (merged.get('size'), merged.get('bold'),
-            merged.get('eastAsia'), merged.get('color'))
-
-
-def enforce_heading_format(doc, level: int, para=None):
-    """确保标题**渲染出来**就是规范的样子，而不只是「套了样式」。
-
-    三步走，对应三种会被用户改坏的地方：
-
-    1. **样式层**——调 :func:`ensure_heading_style`，纠正 Word 样式面板里
-       被改过的字号/加粗/间距（改样式会让所有同类标题一起变形）；
-    2. **字符层**——:func:`strip_char_overrides` 清掉 run 上的直接格式
-       （字号、加粗、字体、字距……），并把粗体按规范定型；
-    3. **段落层**——删掉 ``w:spacing`` / ``w:jc`` / ``w:ind`` / ``w:snapToGrid``
-       / ``w:outlineLvl`` 的段落级覆盖，让间距对齐回到样式；
-       只保留 ``w:pageBreakBefore``（章前分页）这类样式里没有的意图。
-
-    ``para=None`` 时只修样式（用于建文档阶段），随后新建的段落自然会正确。
-    """
-    spec = HEADING_SPEC[level]
-    ensure_heading_style(doc, level)
-
-    if para is None:
-        return None
-
-    # --- 样式套用（若当前不是该 Heading 样式，先套上）---
-    want_style = f'Heading {level}'
-    if para.style.name != want_style:
-        try:
-            para.style = doc.styles[want_style]
-        except KeyError:
-            pass
-    # --- 字符层：**清掉一切直接格式**，只把中/西文字体名写回去 ---
-    #
-    # 为什么字号/字重/颜色不写在 run 上：三者样式层已经有了（见 ensure_heading_style），
-    # run 上再写一份就是「直接格式压过样式」——用户之后在 Word 样式面板里改字号
-    # 会发现改不动，因为 run 那份更优先。让样式成为唯一来源，才既符合规范又受管制。
-    strip_char_overrides(para, keep_bold=bool(spec['bold']))
-    for r in para.runs:
-        _rpr = r._element.get_or_add_rPr()
-        for _tag in ('w:sz', 'w:szCs', 'w:b', 'w:bCs', 'w:i', 'w:iCs',
-                     'w:color', 'w:u', 'w:spacing', 'w:w', 'w:kern', 'w:position'):
-            for _el in _rpr.findall(qn(_tag)):
-                _rpr.remove(_el)
-        _rf = _rpr.get_or_add_rFonts()
-        _rf.set(qn('w:ascii'), EN_FONT)
-        _rf.set(qn('w:hAnsi'), EN_FONT)
-        _rf.set(qn('w:eastAsia'), HEI)
-        _rf.set(qn('w:cs'), EN_FONT)
-    # --- 段落层：让间距/对齐/缩进回到样式 ---
-    ppr = para._p.get_or_add_pPr()
-    for tag in ('w:spacing', 'w:jc', 'w:ind', 'w:snapToGrid', 'w:outlineLvl'):
-        for el in ppr.findall(qn(tag)):
-            ppr.remove(el)
-    return para
-
-
-def heading_format_problems(doc) -> list:
-    """检查所有标题的**有效格式**是否符合 :data:`HEADING_SPEC`。
-
-    只看结果、不看过程：无论问题出在样式被改、还是 run 上有覆盖，
-    只要最终字号/加粗/字体/颜色/对齐/大纲级别不对，就报出来。
-    """
-    problems = []
-    for i, para in enumerate(doc.paragraphs):
-        sn = para.style.name if para.style is not None else ''
-        if not (sn.startswith('Heading') and sn.split()[-1].isdigit()):
-            continue
-        level = int(sn.split()[-1])
-        if level not in HEADING_SPEC or not para.text.strip():
-            continue
-        spec = HEADING_SPEC[level]
-        size, bold, ea, color = _effective_char_fmt(para)
-        label = f'第{i}段 {para.text[:14]!r}'
-        if size is None or abs(size - spec['size']) > 0.01:
-            problems.append(f'{label} 字号 {size}，应为 {spec["size"]}pt')
-        if bool(bold) != bool(spec['bold']):
-            problems.append(f'{label} 加粗 {bold}，应为 {spec["bold"]}（规范只要求黑体字体，不加粗）')
-        if ea != HEI:
-            problems.append(f'{label} 中文字体 {ea!r}，应为 {HEI!r}')
-        if color not in (None, '000000', 'AUTO'):
-            problems.append(f'{label} 颜色 #{color}，应为黑色')
-        ppr = para._p.find(qn('w:pPr'))
-        if ppr is not None:
-            jc = ppr.find(qn('w:jc'))
-            if jc is not None and jc.get(qn('w:val')) != 'left':
-                problems.append(f'{label} 段落对齐 {jc.get(qn("w:val"))}，应为 left')
-            ol = ppr.find(qn('w:outlineLvl'))
-            if ol is not None and ol.get(qn('w:val')) != str(level - 1):
-                problems.append(f'{label} 大纲级别 {ol.get(qn("w:val"))}，应为 {level - 1}')
-        # 段落级的字符覆盖（样式之外的直接格式）
-        for r in para.runs:
-            rpr = r._element.find(qn('w:rPr'))
-            if rpr is None:
-                continue
-            leftover = [t.split(':')[1] for t in _OVERRIDE_RPR_TAGS
-                        if t not in _OVERRIDE_ALLOWED and rpr.find(qn(t)) is not None]
-            if leftover:
-                problems.append(f'{label} run 上残留直接格式 {leftover}（会盖过样式）')
-                break
-    return problems
+# 注意：strip_char_overrides / _effective_char_fmt / enforce_heading_format /
+# heading_format_problems 在本文件**只定义一次**（见下一节「标题三层矫正」）。
+# 这里曾并存一份几乎同名的旧实现——同名函数后定义者生效，极易改错地方，
+# 造成「明明改了却没生效」。已删除旧副本，不要再复制粘贴整段实现。
 
 
 def ensure_heading_style(doc, level: int):
@@ -1024,6 +1002,7 @@ def ensure_heading_style(doc, level: int):
             rpr.remove(el)
     if spec['bold']:
         rpr.append(OxmlElement('w:b'))
+    _fix_order(rpr, _RPR_SEQ)
     # 颜色钉成黑色（python-docx 内置模板的标题自带主题蓝）
     strip_style_color(st, (0, 0, 0))
 
@@ -1328,6 +1307,7 @@ def ensure_style(doc, name: str, style_id: str | None = None,
         _el = OxmlElement(_tag)
         _el.set(qn('w:val'), '1' if bold else '0')
         _srpr.append(_el)
+    _fix_order(_srpr, _RPR_SEQ)
     # 注意：不要再碰 st.font.bold —— 它会把刚写好的 w:b 删掉
     rf = _style_rpr(st).get_or_add_rFonts()
     rf.set(qn('w:ascii'), en)
@@ -1373,6 +1353,7 @@ def ensure_style(doc, name: str, style_id: str | None = None,
         ol = OxmlElement('w:outlineLvl')
         ol.set(qn('w:val'), str(outline))
         ppr.append(ol)
+    _fix_order(ppr, _PPR_SEQ)
     return st
 
 
@@ -1408,7 +1389,7 @@ def apply_style_set(doc):
         ('Caption', dict(cn=SONG, size=PT_CAPTION, align=A.CENTER, line=1.0)),
         ('参考文献标题', dict(cn=HEI, size=PT_ABSTRACT, bold=True, align=A.CENTER,
                            line=LINE_HEADING, after=12, outline=0)),
-        ('参考文献正文', dict(cn=SONG, size=PT_CAPTION, align=A.JUSTIFY,
+        ('参考文献正文', dict(cn=SONG, size=PT_CAPTION, align=REF_ALIGN,
                            line=LINE_BODY, first_line_chars_=0, left=170, hanging=170)),
         ('公式', dict(cn=SONG, size=PT_BODY, align=A.LEFT, line=1.0, before=6, after=6,
                      first_line_chars_=0)),
@@ -1441,7 +1422,42 @@ def apply_style_set(doc):
             for el in rpr.findall(qn(tag)):
                 rpr.remove(el)
         made.append(name)
+
+    made += _ensure_toc_styles(doc)
     return made
+
+
+#: 目录条目样式的左缩进（twips，取自规范第七节：一级 482 / 二级 480 / 三级 840）
+TOC_INDENT = {1: 482, 2: 480, 3: 840}
+
+
+def _ensure_toc_styles(doc) -> list:
+    """把目录条目样式（``toc 1/2/3``，中英版本名字不同）改成规范要求的小四。
+
+    目录条目的**段落本身**不能直接改（文字来自 TOC 域，改了会被「更新域」覆盖，
+    而且改写域结果容易写坏）。正确做法是改 ``toc N`` 样式：Word 更新目录时按这些
+    样式重新渲染条目，字号/行距自然就对了。
+    """
+    A = WD_ALIGN_PARAGRAPH
+    out = []
+    for lvl in (1, 2, 3):
+        for name in (f'toc {lvl}', f'TOC {lvl}'):
+            try:
+                st = doc.styles[name]
+            except KeyError:
+                continue
+            if st.type != WD_STYLE_TYPE.PARAGRAPH:
+                continue
+            try:
+                ensure_style(doc, name, based_on='Normal', cn=SONG, en=EN_FONT,
+                             size=PT_BODY, bold=False, align=A.LEFT,
+                             line=LINE_BODY, first_line_chars_=0,
+                             left=TOC_INDENT[lvl])
+            except Exception:
+                continue
+            # 目录条目的「右对齐 + 点前导」制表位必须保留，ensure_style 不碰 tabs
+            out.append(name)
+    return out
 
 
 def _set_page(sec, top=3.5, bottom=2.5, left=2.5, right=2.5,
@@ -1636,6 +1652,49 @@ def _fill_footer_part(part, style: str, linked: bool | None = None):
     if style == 'dash':
         set_run(p.add_run(' -'), cn=SONG, en=EN_FONT, size=PT_PAGENUM)
     return p
+
+
+def _ensure_cover_footer(sec, school_cn: str = '大连理工大学',
+                         school_en: str = 'Dalian University of Technology'):
+    """封面页脚：印**校名**（中文一行 + 英文一行，居中），**不编页码**。
+
+    规范：封一、封二不编入页码，页脚只有校名。
+
+    为什么要单独写一个函数：``set_page_number_footer(sec, style='none')`` 的语义是
+    **清空页脚**，用它处理封面会连校名一起抹掉（实测：封面页脚变成空的）。
+    这里改为——已经有文字的页脚**原样保留**，空的才补校名；并确保页脚里没有 PAGE 域。
+    """
+    for which in ('footer', 'even_footer', 'first_footer'):
+        try:
+            part = _footer_paragraphs(sec, which)
+        except Exception:
+            continue
+        # 去掉可能残留的 PAGE 域（封面不编页码）
+        for el in part._element.findall('.//' + qn('w:fldSimple')):
+            if 'PAGE' in (el.get(qn('w:instr')) or ''):
+                part._element.remove(el)
+        for el in part._element.iter(qn('w:instrText')):
+            if 'PAGE' in (el.text or ''):
+                el.text = ''
+        text = ''.join(t.text or '' for t in part._element.iter(qn('w:t'))).strip()
+        if text:
+            continue                       # 已有校名 → 不动
+        if not part._has_definition:
+            part.is_linked_to_previous = False
+        p = part.paragraphs[0] if part.paragraphs else part.add_paragraph()
+        for r in list(p.runs):
+            r._r.getparent().remove(r._r)
+        fmt_para(p, align=WD_ALIGN_PARAGRAPH.CENTER, line=1.0, before=0, after=0,
+                 snap_to_grid=False)
+        _set_ind(p, firstLineChars=0, firstLine=0)
+        set_run(p.add_run(school_cn), cn='华文行楷', en='STXingkai',
+                size=FONT_SIZE['小二'])
+        p2 = part.add_paragraph()
+        fmt_para(p2, align=WD_ALIGN_PARAGRAPH.CENTER, line=1.0, before=0, after=0,
+                 snap_to_grid=False)
+        _set_ind(p2, firstLineChars=0, firstLine=0)
+        set_run(p2.add_run(school_en), cn=EN_FONT, en=EN_FONT, size=PT_CAPTION)
+    return sec
 
 
 def set_page_number_footer(sec, fmt: str = 'decimal', start: int | None = 1,
@@ -1866,9 +1925,21 @@ CH_BODY = 'body'       # 正文
 CH_EMPTY = 'empty'     # 空段
 CH_BODY_EN = 'body_en'  # 英文正文（英文摘要等）：Times New Roman，不套宋体
 CH_KEYWORDS = 'kw'      # 「关键词：」「Key Words：」行
+CH_TOC = 'toc'          # 目录条目（toc 1/2/3 样式）——只读，绝不改写
+CH_FIGURE = 'fig'       # 插图段（含 w:drawing / w:pict）——**不能设固定行距**
 
 _CJK_RE = re.compile(r'[\u4e00-\u9fff]')
 _RE_KEYWORDS = re.compile(r'^\s*(关键词\s*[:：]|Key\s*Words\s*[:：]|关键字\s*[:：])', re.I)
+#: 「关键词 / Key Words」题头**只写题头、内容另起一段**时用的匹配
+_RE_KW_LABEL = re.compile(
+    r'^\s*(关键词|关键字|Key\s*Words|Keywords|KEY\s*WORDS|关键字)\s*[:：]\s*(.*)$', re.I)
+_RE_KW_LABEL_ONLY = re.compile(
+    r'^\s*(?:关键词|关键字|Key\s*Words|Keywords|KEY\s*WORDS)\s*[:：]\s*$', re.I)
+#: 目录条目的段落样式名（Word 中英文版本分别叫 toc 1 / TOC 1）
+_RE_TOC_STYLE = re.compile(r'^\s*toc\s*[1-9]\s*$', re.I)
+#: 目录条目的兜底特征：以**制表位** + 页码结尾（Word 生成的目录一定带这个制表位，
+#: 正文段落几乎不会含制表符，所以这个特征很干净）
+_RE_TOC_LINE = re.compile(r'^[^\t]{2,90}\t\s*\d{1,4}\s*$')
 
 
 def is_latin_prose(text: str, threshold: float = 0.35) -> bool:
@@ -1898,7 +1969,9 @@ def _is_prose(text: str, min_len: int = 25) -> bool:
         return False
     if _RE_CH3.match(text or '') or _RE_CH2.match(text or ''):
         return False
-    if _norm_title(text) in _FRONT_TITLES:
+    if _RE_TOC_LINE.match(text or ''):
+        return False
+    if _front_title_key(text) is not None:
         return False
     return True
 
@@ -1938,16 +2011,117 @@ _FRONT_TITLES = {
     '攻读硕士学位期间科研项目及科研成果': ('作者简介', '攻读硕士学位期间科研项目及科研成果'),
     '攻读学位期间科研成果': ('作者简介', '攻读硕士学位期间科研项目及科研成果'),
     '作者简介': ('作者简介', '作者简介'),
+    # 「附录」的文字各不相同（附录A 数据表…），只借这个键取样式与居中规则，
+    # 正文由调用方原样保留，不能按 canonical 覆盖。
+    '附录': ('附录', '附录'),
 }
 _RE_APPENDIX_TITLE = re.compile(r'^\s*附\s*录\s*[A-ZＡ-Ｚ一二三四五六七八九十]?\s*[：:、.．]?\s*(.*)$')
+#: 「附录」标题的**严格**判断：附录后必须跟编号/空格/标点或直接结束。
+#: 不能用 ``_RE_APPENDIX_TITLE`` 那种宽松写法——「附录中给出了……」这种正文句子
+#: 也会被它匹配上，一旦按标题处理就会把正文改成小三黑体居中。
+_RE_APPENDIX_HEAD = re.compile(r'^\s*附\s*录\s*(?:[A-ZＡ-Ｚa-z0-9一二三四五六七八九十]|[\s：:、.．]|$)')
+
+
+def _is_appendix_title(text) -> bool:
+    t = (text or '').strip()
+    return bool(t) and len(t) < 40 and bool(_RE_APPENDIX_HEAD.match(t))
+
+#: 前置章级标题的**别名**（小写归一化后比对）。
+#: 真实文档里的写法五花八门：``参考文献（References）``、``References``、
+#: ``Acknowledgements``、``谢辞``……只认「去空格后精确等于某个键」会漏判，
+#: 漏判的直接后果就是标题没有居中（用户实际反馈的 bug）。
+_FRONT_TITLE_ALIASES = {
+    'REFERENCES': ('references', 'reference', 'bibliography', 'workscited'),
+    'ACKNOWLEDGEMENTS': ('acknowledgements', 'acknowledgments',
+                         'acknowledgement', 'acknowledgment',
+                         '致谢语', '谢辞', '后记', '鸣谢'),
+    'TABLEOFCONTENTS': ('contents', 'tableofcontents', 'contentslists'),
+    '摘要': ('中文摘要', '摘要（中文）'),
+    'ABSTRACT': ('英文摘要', 'abstract（英文）'),
+    '作者简介': ('攻读硕士学位期间科研项目及科研成果', '攻读学位期间科研成果',
+                 '攻读硕士学位期间取得的成果', '攻读博士学位期间科研成果',
+                 '研究成果', '作者简介'),
+}
+#: 结尾的英文对照括注：「参考文献（References）」→ 去掉后再归一化
+_RE_FRONT_EN_PAREN = re.compile(r'[（(]\s*[A-Za-z][A-Za-z .&/\-]{1,40}\s*[)）]\s*$')
+
+
+def _front_title_key(text):
+    """把标题文字归一化成 :data:`_FRONT_TITLES` 的键；认不出返回 ``None``。
+
+    比「去空格后精确匹配」宽一档，覆盖真实论文里的常见写法：
+    ``参 考 文 献`` / ``参考文献（References）`` / ``References`` /
+    ``致　谢`` / ``Acknowledgements`` / ``谢辞`` 等。
+    """
+    t = _norm_title(text)
+    if not t:
+        return None
+    # 顺序很重要：先去掉结尾的英文对照括注「参考文献（References）」，
+    # 再去首尾括号——反过来的话结尾的「）」先被剥掉，括注就匹配不上了。
+    t = _RE_FRONT_EN_PAREN.sub('', t)
+    t = t.strip('[]【】（）()：:，,。.、·-—_ ')
+    t = _RE_FRONT_EN_PAREN.sub('', t).strip('[]【】（）()：:，,。.、·-—_ ')
+    if not t:
+        return None
+    if t in _FRONT_TITLES:
+        return t
+    low = t.lower()
+    for key in _FRONT_TITLES:
+        if key.isascii() and key.lower() == low:
+            return key
+    for key, aliases in _FRONT_TITLE_ALIASES.items():
+        if low in aliases:
+            return key
+    return None
+
+
+def has_drawing(p) -> bool:
+    """段落里是否含图片 / 图形（``w:drawing`` 内联图、``w:pict`` VML、``w:object``）。
+
+    为什么要单独认出来：**固定行距会把嵌入型图片裁掉**。Word 的行框高度被
+    ``w:lineRule="exact"`` 钉死时，行内图片只显示落在行框里的那一条，
+    看上去就是「图片被隐藏了一半」；选中图片按 Ctrl+1（单倍行距）能恢复，
+    就是因为去掉了固定行高。所以凡含图的段落都**不能**用固定行距。
+    """
+    try:
+        return bool(p._p.findall('.//' + qn('w:drawing'))
+                    or p._p.findall('.//' + qn('w:pict'))
+                    or p._p.findall('.//' + qn('w:object')))
+    except Exception:
+        return False
+
+
+def is_toc_paragraph(p) -> bool:
+    """是否是**目录条目**（TOC 域生成的行）。
+
+    这类段落只能只读：文字来自域、且被包在 ``w:hyperlink`` 里，
+    按标题/正文改写会出现「文字翻一倍」与「目录条目变成 Heading」的事故。
+    """
+    try:
+        name = p.style.name if p.style is not None else ''
+    except Exception:
+        name = ''
+    if _RE_TOC_STYLE.match(name or ''):
+        return True
+    # 兜底：带「制表位 + 页码」的短行。带 Heading 样式但内容是目录行的，
+    # 正是「目录条目被套成标题」这种已被改坏的情形，也要认出来。
+    return bool(_RE_TOC_LINE.match(p.text or ''))
 
 
 def classify_paragraph(p, doc=None) -> str:
     """判断一个段落在 DUT 体系里属于哪一类。返回上面的 ``CH_*`` 常量之一。"""
     text = (p.text or '').strip()
     if not text:
+        # 含图的「空段」不是空行：它是插图自己的段落，必须与真正的空行区分开，
+        # 否则会被当空行设成固定行距 25 磅，图片被裁掉一半。
+        if has_drawing(p):
+            return CH_FIGURE
         return CH_EMPTY
     style_name = p.style.name if p.style is not None else ''
+
+    # 目录条目优先排除：它的文字来自 TOC 域，任何改写都是破坏（会翻倍）。
+    if is_toc_paragraph(p):
+        return CH_TOC
 
     # 已经带官方样式名 → 直接采信
     if style_name in ('摘要题目', 'ABSTRACT', '目录', '参考文献标题', '附录', '致谢',
@@ -1973,10 +2147,9 @@ def classify_paragraph(p, doc=None) -> str:
         # 「图 1.1 xxx」不带数字的兜底已由正则覆盖；这里防误判
         pass
 
-    key = _norm_title(text)
-    if key in _FRONT_TITLES:
+    if _front_title_key(text) is not None:
         return CH_FRONT
-    if _RE_APPENDIX_TITLE.match(text) and len(text) < 40:
+    if _is_appendix_title(text):
         return CH_FRONT
 
     if _RE_KEYWORDS.match(text):
@@ -2018,6 +2191,29 @@ def detect_ref_type(entry: str) -> str:
     return '?'
 
 
+#: 参考文献里**不能被「标点补空格」拆开**的片段：网址、邮箱、带点的数字
+#: （版本号 / DOI / 小数）。否则 ``www.gov.cn`` 会被补成 ``www. gov. cn``，
+#: 网址直接作废——这是真实发生过的 bug。
+_RE_REF_URL = re.compile(r'(?:https?|ftp)://[^\s，。；、）)】]+|www\.[^\s，。；、）)】]+')
+_RE_REF_MAIL = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+')
+_RE_REF_DOTTED = re.compile(r'(?<![\w.])\d+(?:\.\d+)+(?![\w.])')
+
+
+def _stash_tokens(s: str, patterns) -> tuple[str, list]:
+    """把 ``patterns`` 命中的片段换成 ``\\x00n\\x00`` 占位符，返回 (新串, 片段表)。"""
+    vault: list = []
+    for pat in patterns:
+        def _keep(m, _v=vault):
+            _v.append(m.group(0))
+            return f'\x00{len(_v) - 1}\x00'
+        s = pat.sub(_keep, s)
+    return s, vault
+
+
+def _restore_tokens(s: str, vault: list) -> str:
+    return re.sub(r'\x00(\d+)\x00', lambda m: vault[int(m.group(1))], s)
+
+
 def format_reference_entry(entry: str, index: int | None = None) -> str:
     """规范化参考文献条目的序号与空格。
 
@@ -2025,6 +2221,7 @@ def format_reference_entry(entry: str, index: int | None = None) -> str:
     * 中文标点后补一个空格，英文标点保持
     * 类型标志统一成大写带方括号
     * 修正 ``et al`` / ``等`` 前多余的空格
+    * **网址 / 邮箱 / 带点数字原样保留**——补空格的规则绝不能伸进 URL 内部
     """
     s = re.sub(r'^\s*\[\s*(\d+)\s*\]\s*', '', entry.strip())
     s = re.sub(r'^\s*(\d+)\s*[.、．]\s*', '', s)
@@ -2033,11 +2230,19 @@ def format_reference_entry(entry: str, index: int | None = None) -> str:
     s = re.sub(r'\[\s*([a-zA-Z]{1,3})(\s*/\s*([a-zA-Z]{2}))?\s*\]',
                lambda m: '[' + m.group(1).upper() + (('/' + m.group(3).upper()) if m.group(3) else '') + ']',
                s)
-    # 中文标点后补空格（但不在数字与单位之间乱加）
-    s = re.sub(r'([。；：，、])\s*', r'\1 ', s)
-    s = re.sub(r'\.\s*', '. ', s)
+    # 先把「不可拆」的片段藏起来，做完标点补空格再放回去
+    s, vault = _stash_tokens(s, (_RE_REF_URL, _RE_REF_MAIL, _RE_REF_DOTTED))
+    # 中文标点后补空格——但**只在后面不是中文时**补。
+    # 「法治轨道上，中医药跑出振兴加速度」不该变成「， 中医药」：
+    # 中文之间本来就不加空格，补了反而改了作者的原文。
+    s = re.sub(r'([。；：，、])(?=[^\s\u4e00-\u9fff])', r'\1 ', s)
+    # 句点后补空格，但**当句点夹在两个西文字母/数字之间时不补**：
+    # www.gov.cn / 10.1234 / abc.def 这类 token 内部的点一旦被补空格就废了。
+    s = re.sub(r'(?<=[^\sA-Za-z0-9])\.\s*', '. ', s)
     s = re.sub(r'\s+', ' ', s).strip()
     s = re.sub(r'\s+([,.;:])', r'\1', s)
+    s = _restore_tokens(s, vault)
+    s = re.sub(r'\s+', ' ', s).strip()
     s = s.replace('et al.', 'et al').replace('ET AL', 'et al')
     n = index if index is not None else 1
     return f'[{n}] {s}'
@@ -2138,17 +2343,245 @@ def order_references(doc, ref_start_heading: str = '参考文献') -> dict:
     for p in ref_paras:
         p._p.getparent().remove(p._p)
 
+    emit = [x for x in final if (not reordered) or x in seen]
+    #: 旧编号 → 新编号。**重排必须同时重编号正文里的标注**：
+    #: 只改条目顺序而不管正文，正文的 [6] 就会指到别的文献上去
+    #: （真实论文里出过一次：正文顺序是 1,2,3,4,5,16,6,…，重排后第 6 位
+    #:  换成了另一篇，而正文还写着 [6]）。
+    mapping = {old: new for new, old in enumerate(emit, start=1)}
+
     prev = paras[blocks[0][0]]
-    for new_i, n in enumerate([x for x in final if (not reordered) or x in seen], start=1):
+    for new_i, n in enumerate(emit, start=1):
         p = doc.add_paragraph()
         set_run(p.add_run(format_reference_entry(entries[n], new_i)),
                 cn=SONG, en=EN_FONT, size=PT_CAPTION)
-        fmt_para(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY, line=LINE_BODY, before=0,
+        fmt_para(p, align=REF_ALIGN, line=LINE_BODY, before=0,
                  after=0, snap_to_grid=False, left_indent_pt=8.5, hanging_pt=8.5)
         prev._p.addnext(p._p)
         prev = p
-    return {'kept': len([x for x in final if (not reordered) or x in seen]),
-            'removed': removed, 'reordered': reordered}
+
+    remap = _remap_citations(paras[:body_end], mapping)
+    return {'kept': len(emit), 'removed': removed, 'reordered': reordered,
+            'numbering': mapping if any(k != v for k, v in mapping.items()) else {},
+            'citations_remapped': remap['changed'],
+            'citations_skipped': remap['skipped']}
+
+
+def _expand_cite(body: str):
+    """展开方括号内的引用编号：``2-4`` → ``[2, 3, 4]``；``2,4`` → ``[2, 4]``。
+
+    解析不了（含非数字内容）返回 ``None``。
+    """
+    nums: list[int] = []
+    for part in re.split(r'\s*,\s*', body.strip()):
+        if not part:
+            return None
+        m = re.fullmatch(r'(\d+)\s*[-–]\s*(\d+)', part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            nums.extend(range(min(a, b), max(a, b) + 1))
+        elif part.isdigit():
+            nums.append(int(part))
+        else:
+            return None
+    return nums or None
+
+
+def _format_cite(nums: list[int]) -> str:
+    """把编号列表写回引用标注：单个 ``[3]``；连续 ``[3-5]``；不连续 ``[3,7]``。"""
+    if len(nums) == 1:
+        return f'[{nums[0]}]'
+    if all(nums[i + 1] == nums[i] + 1 for i in range(len(nums) - 1)):
+        return f'[{nums[0]}-{nums[-1]}]'
+    return '[' + ','.join(str(n) for n in nums) + ']'
+
+
+def _remap_citations(paras, mapping: dict) -> dict:
+    """按 ``mapping``（旧编号 → 新编号）改写正文里的 ``[n]`` 引用标注。
+
+    逐 run 替换（用 :func:`para_runs` 连超链接里的 run 一起），保留上标等字符格式。
+    映射不到的编号**原样保留**并计入 ``skipped``——宁可不改，也不能把标注改错。
+    """
+    changed = skipped = 0
+
+    def _one(m):
+        nonlocal changed, skipped
+        nums = _expand_cite(m.group(0)[1:-1])
+        if not nums or any(n not in mapping for n in nums):
+            skipped += 1
+            return m.group(0)
+        new = _format_cite(sorted({mapping[n] for n in nums}))
+        if new != m.group(0):
+            changed += 1
+        return new
+
+    for p in paras:
+        for run in para_runs(p):
+            t = run.text or ''
+            if '[' not in t:
+                continue
+            new_t = _CITE_RE.sub(_one, t)
+            if new_t != t:
+                run.text = new_t
+    return {'changed': changed, 'skipped': skipped}
+
+
+# --------------------------------------------------------------------------
+# 结构归一化（改写之前 / 之后各跑一遍）
+# --------------------------------------------------------------------------
+
+def _looks_like_keyword_content(p) -> bool:
+    """判断一个段落是否「像关键词内容」（用于识别题头被拆到上一行的情况）。
+
+    保守判断：不超 200 字、不以句号结尾、不是标题/图表题/前置标题/参考文献条目、
+    也不是另一个「关键词：」题头。宁可判否（不合并），也不要把正文吞进关键词行。
+    """
+    body = (p.text or '').strip()
+    if not body or len(body) > 200 or body.endswith('。'):
+        return False
+    if _RE_KW_LABEL.match(body) or _front_title_key(body) is not None:
+        return False
+    if _is_appendix_title(body):
+        return False
+    return classify_paragraph(p) not in (
+        CH_FRONT, CH_LEVEL1, CH_LEVEL2, CH_LEVEL3,
+        CH_CAPTION_FIG, CH_CAPTION_TAB, CH_TOC, CH_REF, CH_FIGURE)
+
+
+def _next_nonempty_paragraph(p):
+    """返回同级的「下一个非空段落」与两者之间的空段落列表。"""
+    blanks, sib = [], p._p.getnext()
+    while sib is not None:
+        if sib.tag != qn('w:p'):
+            return None, []
+        para = Paragraph(sib, p._parent)
+        if (para.text or '').strip():
+            return para, blanks
+        blanks.append(sib)
+        sib = sib.getnext()
+    return None, []
+
+
+def merge_keyword_lines(doc) -> int:
+    """把「关键词：」题头段与其后的关键词内容段**并成一段**。
+
+    规范要求题头与关键词**同一行**：``关键词：A；B；C``。真实草稿里常见
+    「题头单独占一段、内容另起一段」的写法；不合并的话渲染出来就是
+    「关键词：」孤零零一行、内容再起一行——用户明确报过这个 bug。
+
+    只处理**整段就是题头**（``关键词：`` / ``Key Words：``）的段落，且其后
+    （允许中间夹空段，一并删掉）紧跟的第一个非空段必须
+    :func:`_looks_like_keyword_content`。
+
+    :returns: 合并成功的处数。
+    """
+    merged = 0
+    for p in list(doc.paragraphs):
+        if not _RE_KW_LABEL_ONLY.match(p.text or ''):
+            continue
+        m = re.match(r'^\s*(?:关键词|关键字|Key\s*Words|Keywords|KEY\s*WORDS)\s*[:：]',
+                     p.text, re.I)
+        label_head = m.group(0).strip()
+        nxt, blanks = _next_nonempty_paragraph(p)
+        if nxt is None or not _looks_like_keyword_content(nxt):
+            continue
+        replace_text(p, f'{label_head}{nxt.text.strip()}')
+        for b in blanks:                      # 题头与内容之间的空段一并清掉
+            b.getparent().remove(b)
+        nxt._p.getparent().remove(nxt._p)
+        merged += 1
+    return merged
+
+
+def unclip_figures(doc) -> int:
+    """兜底：把「含图片且设了固定行距」的段落改回单倍行距，返回改动处数。
+
+    固定行距会把**嵌入型**图片裁到行高那么高（Word 里表现为图片只剩一条边），
+    这正是「插图被隐藏了一半」的成因；在 Word 里选中图片按 **Ctrl+1**（单倍行距）
+    能立刻恢复，原理相同。
+
+    这里覆盖「图与文字同段」等主循环没走到的情形——只要段落里有图，
+    行距就不能是固定值。
+    """
+    fixed = 0
+    for p in doc.paragraphs:
+        if not has_drawing(p):
+            continue
+        ppr = p._p.find(qn('w:pPr'))
+        sp = ppr.find(qn('w:spacing')) if ppr is not None else None
+        if sp is None or sp.get(qn('w:lineRule')) != 'exact':
+            continue
+        # 固定值里的 line 是「行高磅数」而不是倍数，直接按单倍行距重写
+        sp.set(qn('w:lineRule'), 'auto')
+        sp.set(qn('w:line'), '240')
+        fixed += 1
+    return fixed
+
+
+#: 这些前置标题要**段前分页**（单独起页）
+_FRONT_PAGE_BREAK_STYLES = ('参考文献标题', '附录', '致谢', '作者简介')
+#: 这些前置标题要进目录（outlineLvl=0）
+_FRONT_TOC_STYLES = ('参考文献标题', '附录', '致谢', '作者简介', 'ABSTRACT')
+
+
+def _apply_front_title_format(doc, p, key: str, canonical: str | None = None) -> None:
+    """把一个前置章级标题段落钉成规范样子（居中小三黑体、段后 1 行、无编号）。
+
+    :param canonical: 标题最终文字。默认取 :data:`_FRONT_TITLES` 里的规范写法；
+        附录这种「文字各不相同」的标题由调用方把原文传进来，避免被覆盖成
+        「摘　　要」（这曾是一个真实的写法错误）。
+    """
+    style_name, canonical_default = _FRONT_TITLES[key]
+    canonical = canonical if canonical is not None else canonical_default
+    if _norm_title(p.text) != _norm_title(canonical):
+        replace_text(p, canonical)
+    elif not para_runs(p):
+        p.add_run(canonical)
+    cn = EN_FONT if key in ('ABSTRACT', 'REFERENCES', 'TABLEOFCONTENTS',
+                            'ACKNOWLEDGEMENTS') else HEI
+    for run in para_runs(p):
+        set_run(run, cn=cn, en=EN_FONT, size=PT_ABSTRACT, bold=True)
+    try:
+        p.style = doc.styles[style_name]
+    except KeyError:
+        pass
+    clear_numbering(p)
+    fmt_para(p, align=WD_ALIGN_PARAGRAPH.CENTER, line=LINE_HEADING, before=0, after=12,
+             snap_to_grid=False)
+    _set_ind(p, left=0, firstLineChars=0, firstLine=0)
+    set_outline(p, 0 if style_name in _FRONT_TOC_STYLES else 9)
+    set_keep_with_next(p, True)
+    if style_name in _FRONT_PAGE_BREAK_STYLES:
+        set_page_break_before(p, True)
+
+
+def enforce_front_titles(doc) -> int:
+    """改写**收尾兜底**：按文字把「摘要 / 目录 / 参考文献 / 致谢 …」标题钉正。
+
+    主循环靠 :func:`classify_paragraph` 分类，而分类可能因为源文档的写法
+    （标题套了 ``Heading 1``、带项目符号编号、写成 ``参考文献（References）``
+    这类变体、或标题段落被超链接包裹）而漏判；漏判的后果就是
+    「参考文献 / 致谢标题没有居中」——用户报的 bug 之一。
+
+    这里不依赖分类结果，直接按段落文字再扫一遍并强制居中，
+    顺带清掉标题上的列表编号（否则 Word 会在标题左侧渲染一个黑方块）。
+
+    :returns: 被修正的标题数。
+    """
+    fixed = 0
+    for p in list(doc.paragraphs):
+        if is_toc_paragraph(p):
+            continue
+        key = _front_title_key(p.text)
+        if key is None:
+            txt = (p.text or '').strip()
+            if _is_appendix_title(txt):
+                _apply_front_title_format(doc, p, '附录', canonical=txt)
+                fixed += 1
+            continue
+        _apply_front_title_format(doc, p, key)
+        fixed += 1
+    return fixed
 
 
 # --------------------------------------------------------------------------
@@ -2176,8 +2609,24 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
     paras = list(doc.paragraphs)
     first_h1_seen = False
 
+    # 结构归一化（跑在主循环之前）：把「关键词：」题头段与紧跟的内容段并成一段，
+    # 否则渲染出来题头单独占一行、内容另起一行。
+    stats['keywords_merged'] = merge_keyword_lines(doc)
+    if stats['keywords_merged']:
+        paras = list(doc.paragraphs)          # 合并删掉了段落，重新取一次
+
+    # 封面（封一）单独处理，且**整块跳过后面的主循环**：
+    # 封面标题是「华文细黑 24/22/16 pt 居中」，一旦按正文套格式就会变成
+    # 小四宋体 + 首行缩进 + 两端对齐——用户报的「封面完全不对」就是这个。
+    cover_paras, _cover_tables = cover_region(doc)
+    stats['cover'] = normalize_cover(doc)
+
     for p in paras:
         stats['total'] += 1
+        if p._p in cover_paras:
+            stats['cover_skipped'] = stats.get('cover_skipped', 0) + 1
+            stats['by_kind']['cover'] = stats['by_kind'].get('cover', 0) + 1
+            continue
         kind = classify_paragraph(p)
         stats['by_kind'][kind] = stats['by_kind'].get(kind, 0) + 1
 
@@ -2186,13 +2635,28 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
             _set_ind(p, firstLineChars=0, firstLine=0)
             continue
 
+        if kind == CH_FIGURE:
+            # 插图段：**只能用单倍/多倍行距，绝不能用固定行距**。
+            # 固定行距（w:lineRule="exact"）会把嵌入型图片裁到行高那么高——
+            # Word 里看到的就是「图片只剩一条边、被隐藏了一半」；
+            # 选中图片按 Ctrl+1（单倍行距）能恢复，原理就是去掉固定行高。
+            fmt_para(p, line=1.0, before=0, after=0, snap_to_grid=False)
+            _set_ind(p, firstLineChars=0, firstLine=0)
+            stats['figures'] = stats.get('figures', 0) + 1
+            continue
+
+        if kind == CH_TOC:
+            # 目录条目来自 TOC 域，文字被包在 w:hyperlink 里：**一个字都别动**。
+            # 早期版本按正文/标题改写它们，结果文字翻倍、条目还变成了 Heading。
+            stats['toc_skipped'] = stats.get('toc_skipped', 0) + 1
+            continue
+
         if kind == CH_LEVEL1:
             text = re.sub(r'\s+', ' ', p.text.strip())     # 必须在删 run 之前取
             is_chapter = bool(_RE_CH1.match(text))
-            for r in list(p.runs):
-                r._r.getparent().remove(r._r)
+            replace_text(p, text)
             spec = HEADING_SPEC[1]
-            set_run(p.add_run(text), cn=HEI, en=EN_FONT,
+            set_run(p.runs[-1], cn=HEI, en=EN_FONT,
                     size=spec['size'], bold=spec['bold'])
             # 清掉 run 上的残留直接格式 + 段落级覆盖，并纠正样式本身
             enforce_heading_format(doc, 1, p)
@@ -2206,10 +2670,9 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
 
         elif kind == CH_LEVEL2:
             text = re.sub(r'\s+', ' ', p.text.strip())
-            for r in list(p.runs):
-                r._r.getparent().remove(r._r)
+            replace_text(p, text)
             spec = HEADING_SPEC[2]
-            set_run(p.add_run(text), cn=HEI, en=EN_FONT,
+            set_run(p.runs[-1], cn=HEI, en=EN_FONT,
                     size=spec['size'], bold=spec['bold'])
             enforce_heading_format(doc, 2, p)
             set_keep_with_next(p, True)
@@ -2218,10 +2681,9 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
 
         elif kind == CH_LEVEL3:
             text = re.sub(r'\s+', ' ', p.text.strip())
-            for r in list(p.runs):
-                r._r.getparent().remove(r._r)
+            replace_text(p, text)
             spec = HEADING_SPEC[3]
-            set_run(p.add_run(text), cn=HEI, en=EN_FONT,
+            set_run(p.runs[-1], cn=HEI, en=EN_FONT,
                     size=spec['size'], bold=spec['bold'])
             enforce_heading_format(doc, 3, p)
             set_keep_with_next(p, True)
@@ -2229,36 +2691,20 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
             stats['styled'] += 1
 
         elif kind == CH_FRONT:
-            raw = p.text.strip()
-            key = _norm_title(raw)
-            style_name, canonical = _FRONT_TITLES.get(key, ('摘要题目', raw))
-            for r in list(p.runs):
-                r._r.getparent().remove(r._r)
-            cn = EN_FONT if key in ('ABSTRACT', 'REFERENCES', 'TABLEOFCONTENTS',
-                                    'ACKNOWLEDGEMENTS') else HEI
-            set_run(p.add_run(canonical), cn=cn, en=EN_FONT, size=PT_ABSTRACT,
-                    bold=True)
-            try:
-                p.style = doc.styles[style_name]
-            except KeyError:
-                pass
-            fmt_para(p, align=A.CENTER, line=LINE_HEADING, before=0, after=12,
-                     snap_to_grid=False)
-            _set_ind(p, left=0, firstLineChars=0, firstLine=0)
-            set_outline(p, 0 if style_name in ('参考文献标题', '附录', '致谢', '作者简介', 'ABSTRACT') else 9)
-            set_keep_with_next(p, True)
-            if style_name in ('参考文献标题', '附录', '致谢', '作者简介'):
-                set_page_break_before(p, True)
-                stats['page_breaks'] += 1
+            key = _front_title_key(p.text)
+            if key is None:
+                # 附录标题（「附录A 数据表」）文字各不相同：保留原文，只套「附录」样式
+                _apply_front_title_format(doc, p, '附录', canonical=p.text.strip())
+            else:
+                _apply_front_title_format(doc, p, key)
             stats['styled'] += 1
 
         elif kind in (CH_CAPTION_FIG, CH_CAPTION_TAB):
             is_fig = kind == CH_CAPTION_FIG
             txt = re.sub(r'\s+', ' ', p.text.strip())
             txt = re.sub(r'^(图|表|Fig\.?|Tab\.?)\s*', lambda m: m.group(1) + ' ', txt)
-            for r in list(p.runs):
-                r._r.getparent().remove(r._r)
-            set_run(p.add_run(txt), cn=SONG if is_fig else SONG, en=EN_FONT,
+            replace_text(p, txt)
+            set_run(p.runs[-1], cn=SONG if is_fig else SONG, en=EN_FONT,
                     size=PT_CAPTION)
             fmt_para(p, align=A.CENTER, line=1.0, before=3 if is_fig else 6,
                      after=6 if is_fig else 3, snap_to_grid=False)
@@ -2270,17 +2716,18 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
             stats['styled'] += 1
 
         elif kind == CH_REF:
-            text = re.sub(r'\s+', ' ', p.text.strip())
-            for r in list(p.runs):
-                r._r.getparent().remove(r._r)
-            set_run(p.add_run(text), cn=SONG,
-                    en=EN_FONT, size=PT_CAPTION)
+            # 不重写文字：参考文献常带 DOI/网址超链接，重写会把链接丢掉；
+            # 只要把每个 run（含超链接里的）套上宋体五号即可。
+            for r in para_runs(p):
+                set_run(r, cn=SONG, en=EN_FONT, size=PT_CAPTION)
             try:
                 p.style = doc.styles['参考文献正文']
             except KeyError:
                 pass
-            fmt_para(p, align=A.JUSTIFY, line=LINE_BODY, before=0, after=0,
+            # 左对齐：条目里常有超长 URL，两端对齐会把前一行字距拉爆
+            fmt_para(p, align=REF_ALIGN, line=LINE_BODY, before=0, after=0,
                      snap_to_grid=False, left_indent_pt=8.5, hanging_pt=8.5)
+            _set_ind(p, firstLineChars=0, firstLine=0)
             stats['refs'] += 1
             stats['styled'] += 1
 
@@ -2290,21 +2737,23 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
             m = _RE_KEYWORDS.match(raw)
             head, rest = (m.group(1), raw[m.end():]) if m else (raw, '')
             is_en = bool(re.match(r'\s*(Key\s*Words|Keywords)', head, re.I))
-            for r in list(p.runs):
-                r._r.getparent().remove(r._r)
-            set_run(p.add_run(head), cn=(EN_FONT if is_en else HEI),
+            r_head = replace_text(p, head)
+            set_run(r_head, cn=(EN_FONT if is_en else HEI),
                     en=EN_FONT, size=PT_BODY, bold=is_en)
             if rest:
                 set_run(p.add_run(rest), cn=(EN_FONT if is_en else SONG),
                         en=EN_FONT, size=PT_BODY)
-            fmt_para(p, align=A.JUSTIFY, line=LINE_BODY, before=0, after=0,
+            # 题头与关键词必须在**同一行**（已在 merge_keyword_lines 里合并）；
+            # 左对齐避免关键词换行时第一行被拉成大字距
+            fmt_para(p, align=A.LEFT, line=LINE_BODY, before=0, after=0,
                      snap_to_grid=False)
             _set_ind(p, firstLineChars=0, firstLine=0)
             stats['styled'] += 1
 
         elif kind == CH_BODY_EN:
-            # 英文正文：Times New Roman 小四，首行缩进 2 字符，不套宋体
-            for r in list(p.runs):
+            # 英文正文：Times New Roman 小四，首行缩进 2 字符，不套宋体。
+            # 用 para_runs：超链接里的文字也要一起改字体，否则同一段两种字体。
+            for r in para_runs(p):
                 set_run(r, cn=EN_FONT, en=EN_FONT, size=PT_BODY)
             fmt_para(p, align=A.JUSTIFY, line=LINE_BODY, before=0, after=0,
                      snap_to_grid=False)
@@ -2312,16 +2761,24 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
             stats['styled'] += 1
 
         else:  # CH_BODY
-            for r in list(p.runs):
+            for r in para_runs(p):
                 set_run(r, cn=SONG, en=EN_FONT, size=PT_BODY)
             fmt_para(p, align=A.JUSTIFY, line=LINE_BODY, before=0, after=0,
                      snap_to_grid=False)
             first_line_chars(p, 2)
             stats['styled'] += 1
 
+    # 兜底：含图的段落不能用固定行距，否则嵌入型图片会被裁掉一半
+    stats['figures_unclipped'] = unclip_figures(doc)
+
     # 三线表
     for t in doc.tables:
-        _normalize_table(t)
+        # 封面字段表不是三线表：它的横线是「填写线」（值单元格下边框，0.5 磅），
+        # 按三线表处理会给封面加上下两条粗黑线、还把填写线抹掉。
+        if is_field_table(t):
+            _normalize_field_table(t)
+        else:
+            _normalize_table(t)
 
     # 分节页码与页眉
     _apply_sections_and_numbering(doc, title_cn=title_cn)
@@ -2340,11 +2797,20 @@ def reformat(doc, mode: str = 'reformat', add_front_matter: bool = False,
         stats['toc_field_added'] = ensure_toc_field(doc)
     except Exception as exc:
         stats['toc_field_added'] = f'error: {exc}'
+
+    # 收尾兜底：按文字把「摘要 / 目录 / 参考文献 / 致谢 …」标题钉正（居中、去编号）。
+    # 分类漏判（标题套了 Heading、写成变体、带项目符号）会让标题不居中，
+    # 这一步不依赖分类，能兜住。
+    stats['front_titles_fixed'] = enforce_front_titles(doc)
     return stats
 
 
 def _normalize_table(t: Table):
-    """把任意表格转成 DUT 三线表：去竖线、上线/下线 1.5pt、表头线 1pt。"""
+    """把任意表格转成 DUT 三线表：去竖线、上线/下线 1.5pt、表头线 1pt。
+
+    **封面字段表不在此列**——那种表的横线是「填写线」，走
+    :func:`_normalize_field_table`。见 :func:`is_field_table`。
+    """
     _clear_table_borders(t)
     t.alignment = WD_TABLE_ALIGNMENT.CENTER
     nrow = len(t.rows)
@@ -2354,12 +2820,171 @@ def _normalize_table(t: Table):
                 fmt_para(p, align=WD_ALIGN_PARAGRAPH.CENTER, line=1.25,
                          before=1, after=1, snap_to_grid=False)
                 _set_ind(p, firstLineChars=0, firstLine=0)
-                for r in p.runs:
+                for r in para_runs(p):
                     set_run(r, cn=SONG, en=EN_FONT, size=PT_CAPTION)
             top = 12 if i == 0 else None
             bottom = 8 if i == 0 else (12 if i == nrow - 1 else 0)
             _set_cell_borders(cell, top=top, bottom=bottom, left=0, right=0)
     return t
+
+
+# --------------------------------------------------------------------------
+# 封面（封一）
+# --------------------------------------------------------------------------
+
+#: 封面字段表的表级边框若全为 none、且中间列每格都是「：」，就是字段块
+_RE_COVER_LABEL = re.compile(r'^.*?(?:硕士|博士|专业学位)?\s*学\s*位\s*论\s*文$')
+
+
+def is_field_table(t: Table) -> bool:
+    """是否是封面「字段块」表格（``标签 | ： | 值``，用下边框模拟填写横线）。
+
+    判据（宽松但很独特）：**恰好 3 列** + 表级边框全 none + 中间列每格都是「：」。
+
+    为什么要单独认它：这种表的横线是**填写线**，不是三线表的三条线。
+    早期 ``reformat()`` 对所有表格一律 :func:`_normalize_table`，结果封面长出
+    上下两条 1.5 磅粗黑线、填写线被抹掉——用户报的 bug 就是这个。
+    """
+    try:
+        if len(t.columns) != 3:
+            return False
+        b = t._tbl.tblPr.find(qn('w:tblBorders'))
+        if b is not None:
+            for edge in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
+                el = b.find(qn('w:' + edge))
+                if el is not None and (el.get(qn('w:val')) or 'none') != 'none':
+                    return False
+        for row in t.rows:
+            if len(row.cells) != 3:
+                return False
+            if (row.cells[1].text or '').strip() not in ('：', ':'):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_field_table(t: Table) -> Table:
+    """把封面字段表钉回「填写线」形态：只留值单元格的下边框（0.5 磅）。
+
+    **只动边框**，不动文字 / 字号 / 对齐 / 行高——用户已经排好的封面不能被二次改写。
+    这样即使源文档的封面字段表已经被误转成三线表，也能修回来。
+    """
+    _clear_table_borders(t)
+    t.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for row in t.rows:
+        n = len(row.cells)
+        for i, cell in enumerate(row.cells):
+            _set_cell_borders(cell, top=0, left=0, right=0,
+                              bottom=(4 if i == n - 1 else 0))
+    return t
+
+
+def _body_blocks(doc) -> list:
+    """``body`` 的直接子元素里，属于 ``doc.paragraphs`` / ``doc.tables`` 的那些。
+
+    两者的索引一一对应，因此可以拿它把「段落」和「表格」放进同一个顺序里，
+    从而判断封面到哪里结束。
+    """
+    return [el for el in doc.element.body if el.tag in (qn('w:p'), qn('w:tbl'))]
+
+
+def cover_region(doc) -> tuple[set, list]:
+    """识别封面（封一）区域。
+
+    :returns: ``(段落元素集合, 封面表格列表)``。主循环会**整块跳过**这些段落。
+
+    两条判据，优先用第 ① 条：
+
+    ① **以封面字段表为锚**：有字段表说明封面就在文档开头，取它之前的全部段落
+       与它之后紧跟的空段。这个判据很准，不依赖文档有没有正确分节
+       （实测用户原稿的第一节里还混着摘要——按"第一节"划范围会连带跳过摘要）。
+    ② 兜底：文档开头连续的**空段 / 居中段**，遇到「摘要」这类前置标题、
+       Heading 或普通正文段就停。
+    """
+    kids = _body_blocks(doc)
+    tbl_of = {t._tbl: t for t in doc.tables}
+    if kids:
+        for i, el in enumerate(kids):
+            if el.tag == qn('w:tbl') and is_field_table(tbl_of[el]):
+                paras = {k for k in kids[:i] if k.tag == qn('w:p')}
+                j = i + 1
+                while j < len(kids) and kids[j].tag == qn('w:p'):
+                    if (Paragraph(kids[j], doc).text or '').strip():
+                        break
+                    paras.add(kids[j])
+                    j += 1
+                return paras, [tbl_of[el]]
+
+    paras: set = set()
+    for el in kids:
+        if el.tag != qn('w:p'):
+            break
+        p = Paragraph(el, doc)
+        txt = (p.text or '').strip()
+        if not txt:
+            paras.add(el)
+            continue
+        if _front_title_key(txt) is not None or _is_appendix_title(txt):
+            break
+        name = p.style.name if p.style is not None else ''
+        if name.startswith('Heading') or len(txt) > 120:
+            break
+        if is_centered(p):
+            paras.add(el)
+            continue
+        break
+    return paras, []
+
+
+def normalize_cover(doc) -> dict:
+    """按规范（研究生院格式规范 docx 的首页样式）钉正封面（封一）。
+
+    规范取值与 :func:`add_cover` **逐项一致**（改一处必须改两处）：
+
+    ===========================  ==============  ==========
+    项目                          字号            Word sz
+    ===========================  ==============  ==========
+    「硕 士 学 位 论 文」          华文细黑加粗 24pt   48
+    中文题目                      华文细黑加粗 22pt   44
+    英文题目                      加粗 16pt           32
+    ===========================  ==============  ==========
+
+    封面**绝不能**按正文套格式（否则变成小四宋体 + 首行缩进 + 两端对齐，
+    标题页就毁了——用户报的 bug）；字段表也只修边框、不改成三线表。
+    """
+    cover, tables = cover_region(doc)
+    out = {'paragraphs': 0, 'field_tables': 0}
+    if not cover and not tables:
+        return out
+
+    for t in tables:
+        _normalize_field_table(t)
+        out['field_tables'] += 1
+
+    # 按顺序取封面里的非空段落：第一行=学位类型，第二行=中文题目，第三行=英文题目
+    lines = [p for p in doc.paragraphs if p._p in cover and (p.text or '').strip()]
+    spec = (
+        dict(size=FONT_SIZE['小二'] + 6, cn='华文细黑', en='STXihei',
+             bold=True, after=24),                                   # 硕 士 学 位 论 文
+        dict(size=FONT_SIZE['二号'], cn='华文细黑', en='STXihei',
+             bold=True, after=12),                                   # 中文题目
+        dict(size=FONT_SIZE['三号'], cn=EN_FONT, en=EN_FONT,
+             bold=True, after=36),                                   # 英文题目
+    )
+    if lines and _RE_COVER_LABEL.match(_norm_title(lines[0].text)):
+        for p, cfg in zip(lines[:3], spec):
+            if cfg is spec[2] and not is_latin_prose(p.text):
+                break                       # 第三行不是英文题目就别硬改
+            clear_numbering(p)
+            for r in para_runs(p) or [p.add_run((p.text or '').strip())]:
+                set_run(r, cn=cfg['cn'], en=cfg['en'], size=cfg['size'],
+                        bold=cfg['bold'])
+            fmt_para(p, align=WD_ALIGN_PARAGRAPH.CENTER, line=1.5, before=0,
+                     after=cfg['after'], snap_to_grid=False)
+            _set_ind(p, left=0, firstLineChars=0, firstLine=0)
+            out['paragraphs'] += 1
+    return out
 
 
 def _apply_sections_and_numbering(doc, title_cn: str | None = None):
@@ -2380,8 +3005,10 @@ def _apply_sections_and_numbering(doc, title_cn: str | None = None):
     for i, sec in enumerate(doc.sections):
         _set_page(sec)
         if i == 0:
-            # 封面：无页码、**无页眉**（规范：封一、封二不编入页码）
-            set_page_number_footer(sec, fmt='decimal', start=1, style='none')
+            # 封面：无页码、**无页眉**（规范：封一、封二不编入页码），
+            # 页脚只印校名——注意不能用 style='none' 清空页脚，那会把校名一起抹掉。
+            set_pgnum(sec, 'decimal', 1)
+            _ensure_cover_footer(sec)
             set_header_pair(sec, odd_text='', even_text='')
             continue
         if i == 1:
@@ -2540,13 +3167,159 @@ def audit(doc) -> dict:
         issues.append(f'{len(head_problems)} 处标题格式不符规范：'
                       + '；'.join(head_problems[:3]))
 
+    # 前置章级标题（摘要/ABSTRACT/目录/参考文献/致谢/附录…）：必须**居中**、
+    # 没有列表编号、字号字体正确。用户报过「参考文献/致谢标题没有居中」，
+    # 这类问题只在渲染时看得见，所以必须逐段查有效格式。
+    front_bad_align, front_bad_fmt, front_numbered, front_checked = [], [], [], 0
+    for p in doc.paragraphs:
+        if is_toc_paragraph(p):
+            continue
+        txt = (p.text or '').strip()
+        key = _front_title_key(p.text)
+        if key is None:
+            if not _is_appendix_title(txt):
+                continue
+            key = '附录'
+        front_checked += 1
+        if not is_centered(p):
+            front_bad_align.append(txt[:16])
+        ppr = p._p.find(qn('w:pPr'))
+        if ppr is not None and ppr.find(qn('w:numPr')) is not None:
+            front_numbered.append(txt[:16])
+        size, bold, ea, color = _effective_char_fmt(p)
+        want_ea = EN_FONT if key in ('ABSTRACT', 'REFERENCES', 'TABLEOFCONTENTS',
+                                     'ACKNOWLEDGEMENTS') else HEI
+        if ea != want_ea or size is None or abs(size - PT_ABSTRACT) > 0.1:
+            front_bad_fmt.append(f'{txt[:12]}({ea}/{size})')
+    info['front_titles_checked'] = front_checked
+    if front_bad_align:
+        issues.append(f'{len(front_bad_align)} 个前置标题没有居中（应为小三黑体居中）：'
+                      + '、'.join(front_bad_align[:4]))
+    if front_bad_fmt:
+        issues.append(f'{len(front_bad_fmt)} 个前置标题字号/字体不符（应为小三黑体，'
+                      f'英文标题为 Times New Roman）：' + '、'.join(front_bad_fmt[:4]))
+    if front_numbered:
+        issues.append(f'{len(front_numbered)} 个前置标题带自动编号/项目符号'
+                      f'（Word 里会在标题左侧渲染出黑方块）：' + '、'.join(front_numbered[:4]))
+
+    # 「关键词：」题头**必须与关键词同一行**。题头单独成段是真实草稿里的常见写法，
+    # 渲染出来就是题头孤零零一行——用户明确报过。
+    # 注意区分两种情况：题头后面**确实另起一段写了关键词**（拆分 → 违规），
+    # 与骨架里根本没填关键词（空占位 → 只是提示，不算违规）。
+    kw_split, kw_empty, kw_found = [], [], 0
+    for p in doc.paragraphs:
+        txt = (p.text or '').strip()
+        if _RE_KW_LABEL_ONLY.match(txt):
+            nxt, _ = _next_nonempty_paragraph(p)
+            if nxt is not None and _looks_like_keyword_content(nxt):
+                kw_split.append(txt[:12])
+            else:
+                kw_empty.append(txt[:12])
+        elif _RE_KW_LABEL.match(txt):
+            kw_found += 1
+    info['keyword_lines'] = kw_found
+    if kw_split:
+        issues.append(f'{len(kw_split)} 处「关键词/Key Words」题头与内容被拆成了两行'
+                      f'（应在同一行）：' + '、'.join(kw_split[:4]))
+    if not kw_found:
+        warnings.append('没有找到已填写的「关键词：」行（摘要后必须有 3–5 个关键词）'
+                        + ('；检测到空占位：' + '、'.join(kw_empty[:4]) if kw_empty else ''))
+
+    # 目录条目：不能被套成 Heading（那样会连页码一起进目录、文字还可能翻倍）
+    toc_as_heading = []
+    for p in doc.paragraphs:
+        sn = p.style.name if p.style is not None else ''
+        if sn.startswith('Heading') and _RE_TOC_LINE.match(p.text or ''):
+            toc_as_heading.append((p.text or '')[:16])
+    if toc_as_heading:
+        issues.append(f'{len(toc_as_heading)} 个目录条目被套成了标题样式'
+                      f'（目录应由 TOC 域生成，条目不要手工改）：'
+                      + '、'.join(toc_as_heading[:4]))
+
+    # 段落/字符属性的**子元素顺序**必须符合 OOXML schema（CT_PPr / CT_RPr 都是
+    # sequence）。手工 append 很容易写出不合规顺序，不同软件对它的容忍度不一致：
+    ppr_bad, rpr_bad, order_example = 0, 0, ''
+    for p in doc.paragraphs:
+        ppr = p._p.find(qn('w:pPr'))
+        if ppr is not None and _order_is_bad(ppr, _PPR_SEQ):
+            ppr_bad += 1
+            order_example = order_example or (p.text or '')[:12]
+        for r in para_runs(p):
+            rpr = r._element.find(qn('w:rPr'))
+            if rpr is not None and _order_is_bad(rpr, _RPR_SEQ):
+                rpr_bad += 1
+                break
+    info['element_order_bad'] = {'pPr': ppr_bad, 'rPr': rpr_bad}
+    if ppr_bad:
+        issues.append(f'{ppr_bad} 个段落的 w:pPr 子元素顺序不符合 OOXML schema 顺序'
+                      f'（可能被 Word 忽略，或被判为「文档损坏」）：{order_example!r}')
+    if rpr_bad:
+        issues.append(f'{rpr_bad} 个 run 的 w:rPr 子元素顺序不符合 OOXML schema 顺序'
+                      f'（字号/加粗等属性可能被忽略）')
+
+    # 参考文献条目：网址里不能有空格（补标点空格的规则曾把 www.gov.cn 拆成
+    # 「www. gov. cn」，网址直接作废），也不能两端对齐（长 URL 会把上一行字距拉爆）
+    ref_url_broken, ref_justified, ref_checked = [], [], 0
+    for p in doc.paragraphs:
+        if classify_paragraph(p) != CH_REF:
+            continue
+        ref_checked += 1
+        txt = p.text or ''
+        for m in _RE_REF_URL.finditer(txt):
+            if re.search(r'\s', m.group(0)):
+                ref_url_broken.append(txt[:16])
+                break
+        else:
+            if re.search(r'https?://|www\.', txt) and (effective_align(p) or '').lower() == 'both':
+                ref_justified.append(txt[:16])
+    info['refs_checked'] = ref_checked
+    if ref_url_broken:
+        issues.append(f'{len(ref_url_broken)} 条参考文献的网址被空格拆断'
+                      f'（网址内部不能插空格）：' + '、'.join(ref_url_broken[:4]))
+    if ref_justified:
+        issues.append(f'{len(ref_justified)} 条含网址的参考文献是两端对齐，'
+                      f'长 URL 会把上一行字距拉爆（应左对齐）：' + '、'.join(ref_justified[:4]))
+
+    # 正文引用标号必须都能在参考文献里找到。
+    # 参考文献按引用顺序重排后若**没有同步重编号**，正文的 [6] 就会指到别的文献上，
+    # 甚至指向不存在的编号——送审必被打回的硬伤。
+    ref_nums = set()
+    for p in doc.paragraphs:
+        if classify_paragraph(p) != CH_REF:
+            continue
+        m = re.match(r'^\s*\[\s*(\d+)\s*\]', p.text or '')
+        if m:
+            ref_nums.add(int(m.group(1)))
+    if ref_nums:
+        dangling, cite_seen = [], set()
+        for p in doc.paragraphs:
+            if is_toc_paragraph(p) or classify_paragraph(p) == CH_REF:
+                continue
+            for m in _CITE_RE.finditer(p.text or ''):
+                nums = _expand_cite(m.group(0)[1:-1])
+                if not nums:
+                    continue
+                for n in nums:
+                    cite_seen.add(n)
+                    if n not in ref_nums and n not in dangling:
+                        dangling.append(n)
+        info['citations_checked'] = sorted(cite_seen)
+        if dangling:
+            issues.append(f'正文引用了参考文献里不存在的编号 {sorted(dangling)}'
+                          f'（重排参考文献后必须同步重编号正文标注）')
+
     # 正文字体与缩进抽查——只看「真正的陈述性段落」。
     # 空白骨架里的占位小标题（如「摘　　要」下还没写内容）不应被算作正文，
     # 因此用 _is_prose() 做二次过滤，避免误报。
+    # **封面段落也要排除**：封面标题是「华文细黑 24/22/16 pt 居中」，
+    # 既不是宋体也不缩进，按正文规则去查必然误报。
+    cover_paras, _cover_tbls = cover_region(doc)
     body_bad_font, body_bad_indent, body_grid, body_checked = 0, 0, 0, 0
     for p in doc.paragraphs:
         # 只检查**中文**陈述性正文：英文摘要用 Times New Roman，
         # 「关键词：」行按规范本就不缩进，都不能按中文正文的规则去要求。
+        if p._p in cover_paras:
+            continue
         if classify_paragraph(p) != CH_BODY or not _is_prose(p.text):
             continue
         body_checked += 1
@@ -2604,6 +3377,29 @@ def audit(doc) -> dict:
 
     # 三线表
     for i, t in enumerate(doc.tables):
+        if is_field_table(t):
+            # 封面字段块：填写线必须还在（值单元格下边框 0.5 磅），
+            # 且**不能**出现三线表那两条粗线（曾经被误转成三线表）。
+            n = len(t.columns)
+            for row in t.rows:
+                for ci, cell in enumerate(row.cells):
+                    tcpr = cell._tc.find(qn('w:tcPr'))
+                    cb = tcpr.find(qn('w:tcBorders')) if tcpr is not None else None
+                    if cb is None:
+                        continue
+                    top = cb.find(qn('w:top'))
+                    bottom = cb.find(qn('w:bottom'))
+                    if top is not None and (top.get(qn('w:sz')) or '0') not in ('0', ''):
+                        issues.append('封面字段表被加了上线（不是三线表，它的横线是「填写线」）')
+                        break
+                    if ci == n - 1:
+                        if bottom is None or bottom.get(qn('w:sz')) != '4':
+                            issues.append('封面字段表的值单元格缺少填写线（下边框 0.5 磅）')
+                            break
+                    elif bottom is not None and (bottom.get(qn('w:sz')) or '0') not in ('0', ''):
+                        issues.append(f'封面字段表第 {ci + 1} 列多了一条横线（只应有值列的填写线）')
+                        break
+            continue
         tblPr = t._tbl.tblPr
         b = tblPr.find(qn('w:tblBorders'))
         if b is not None:
@@ -2613,6 +3409,22 @@ def audit(doc) -> dict:
                     issues.append(f'表 {i + 1} 有竖线/内框，不是三线表')
                     break
     info['tables'] = len(doc.tables)
+
+    # 含图的段落**不能用固定行距**：固定行高会把嵌入型图片裁到行高那么高，
+    # Word 里看起来就是「图片只剩一条边 / 被隐藏了一半」。
+    # （用户在 Word 里选中图片按 Ctrl+1 改单倍行距即可恢复，正是这个原因。）
+    clipped = []
+    for p in doc.paragraphs:
+        if not has_drawing(p):
+            continue
+        ppr = p._p.find(qn('w:pPr'))
+        sp = ppr.find(qn('w:spacing')) if ppr is not None else None
+        if sp is not None and sp.get(qn('w:lineRule')) == 'exact':
+            clipped.append((p.text or '').strip()[:12] or '插图段')
+    info['figures_checked'] = sum(1 for p in doc.paragraphs if has_drawing(p))
+    if clipped:
+        issues.append(f'{len(clipped)} 个含图的段落用了固定行距，嵌入型图片会被裁掉一半'
+                      f'（应改单倍行距）：' + '、'.join(clipped[:4]))
 
     info['issues'] = issues
     info['warnings'] = warnings
@@ -2633,7 +3445,9 @@ def print_report(result: dict, title: str = 'DUT 格式报告') -> str:
             lines.append(f'  ! 提示：{w}')
         for k in ('sections', 'page', 'even_odd_headers', 'update_fields',
                   'toc_field', 'page_field', 'headings', 'tables',
-                  'nonzero_colors', 'heading_format_problems'):
+                  'nonzero_colors', 'heading_format_problems',
+                  'front_titles_checked', 'keyword_lines', 'refs_checked',
+                  'citations_checked', 'element_order_bad', 'figures_checked'):
             if k in result:
                 lines.append(f'  · {k}: {result[k]}')
     else:
@@ -2641,11 +3455,23 @@ def print_report(result: dict, title: str = 'DUT 格式报告') -> str:
         lines.append(f"  标题 {result.get('headings')}，图表题 {result.get('captions')}，"
                      f"参考文献 {result.get('refs')}，分页 {result.get('page_breaks')}")
         lines.append(f"  分类明细: {result.get('by_kind')}")
+        lines.append(f"  关键词行合并 {result.get('keywords_merged', 0)} 处，"
+                     f"前置标题钉正 {result.get('front_titles_fixed', 0)} 个，"
+                     f"目录条目跳过 {result.get('toc_skipped', 0)} 个，"
+                     f"封面跳过 {result.get('cover_skipped', 0)} 段，"
+                     f"插图段 {result.get('figures', 0)} 个"
+                     + (f"（解除固定行距 {result['figures_unclipped']} 处）"
+                        if result.get('figures_unclipped') else ''))
         refs = result.get('references')
         if refs:
             lines.append(f"  参考文献重排: kept={refs.get('kept')} "
                          f"removed={len(refs.get('removed') or [])} "
-                         f"reordered={refs.get('reordered')}")
+                         f"reordered={refs.get('reordered')} "
+                         f"正文标注重编号={refs.get('citations_remapped', 0)} 处"
+                         + (f"，未映射 {refs['citations_skipped']} 处"
+                            if refs.get('citations_skipped') else ''))
+            if refs.get('numbering'):
+                lines.append(f"  旧→新编号: {refs['numbering']}")
     text = '\n'.join(lines)
     print(text)
     return text
